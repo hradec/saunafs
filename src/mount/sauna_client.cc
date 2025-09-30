@@ -93,11 +93,6 @@ namespace SaunaClient {
 
 #define MAX_FILE_SIZE (int64_t)(SFS_MAX_FILE_SIZE)
 
-#define PKGVERSION \
-		((SAUNAFS_PACKAGE_VERSION_MAJOR)*1000000 + \
-		(SAUNAFS_PACKAGE_VERSION_MINOR)*1000 + \
-		(SAUNAFS_PACKAGE_VERSION_MICRO))
-
 // #define MASTER_NAME ".master"
 // #define MASTER_INODE 0x7FFFFFFF
 // 0x01b6 == 0666
@@ -3646,7 +3641,21 @@ void fs_init(FsInitParams &params) {
 	try {
 		IoLimitsConfigLoader loader;
 		if (!params.io_limits_config_file.empty()) {
-			loader.load(std::ifstream(params.io_limits_config_file.c_str()));
+			std::ifstream ifs(params.io_limits_config_file);
+			if (!ifs.is_open()) {
+				const char *strError = std::strerror(errno);
+				safs::log_warn(
+				    "fs_init: cannot open I/O limits configuration file '{}': {}; using master-provided limits if available, otherwise no client-side limiting.",
+				    params.io_limits_config_file.c_str(), strError);
+			} else {
+				try {
+					loader.load(std::move(ifs));
+				} catch (const Exception &ex) {
+					safs::log_warn(
+					    "fs_init: failed to parse I/O limits configuration file '{}': {}; using master-provided limits if available, otherwise no client-side limiting.",
+					    params.io_limits_config_file.c_str(), ex.what());
+				}
+			}
 		}
 		gMountLimiter().loadConfiguration(loader);
 	} catch (Exception &ex) {

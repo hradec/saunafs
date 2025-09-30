@@ -28,6 +28,7 @@
 #include <syslog.h>
 #include <unistd.h>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +40,7 @@
 #include "chunkserver/network_stats.h"
 #include "common/charts.h"
 #include "common/event_loop.h"
+#include "slogger/slogger.h"
 
 #define CHARTS_FILENAME "csstats.sfs"
 
@@ -72,8 +74,11 @@
 #define CHARTS_TEST 27
 #define CHARTS_CHUNKIOJOBS 28
 #define CHARTS_CHUNKOPJOBS 29
+#define CHARTS_MEMORY 30
 
-#define CHARTS_NUMBER 30
+#define CHARTS_NUMBER 31
+
+const unsigned long kLinuxMaxrssSize = 1024UL;
 
 /* name , join mode , percent , scale , multiplier , divisor */
 #define STATDEFS { \
@@ -107,6 +112,7 @@
 	{"test"             ,CHARTS_MODE_ADD,0,CHARTS_SCALE_NONE ,   1, 1}, \
 	{"chunkiojobs"      ,CHARTS_MODE_MAX,0,CHARTS_SCALE_NONE ,   1, 1}, \
 	{"chunkopjobs"      ,CHARTS_MODE_MAX,0,CHARTS_SCALE_NONE ,   1, 1}, \
+	{"memory"           ,CHARTS_MODE_MAX,0,CHARTS_SCALE_NONE ,   1, 1}, \
 	{NULL               ,0              ,0,0                 ,   0, 0}  \
 };
 
@@ -133,8 +139,32 @@ static const estatdef estatdefs[]=ESTATDEFS
 
 static struct itimerval it_set;
 
+// Signal handler that prevents process termination from timer signals
+static void timerSignalHandler(int /*signal*/) {
+	// Reset both timers to prevent future signals from killing the process
+	setitimer(ITIMER_PROF, &it_set, nullptr);
+	setitimer(ITIMER_VIRTUAL, &it_set, nullptr);
+}
+
 inline uint32_t toMicroSeconds(struct itimerval &itimer) {
     return itimer.it_value.tv_sec * 1000000 + itimer.it_value.tv_usec;
+}
+
+// NOLINTNEXTLINE(misc-use-anonymous-namespace)
+static uint64_t GetMemUsage() {
+	struct rusage resUse{};
+	int err = getrusage(RUSAGE_SELF, &resUse);
+	if (err != -1) {
+#ifdef __APPLE__
+		return resUse.ru_maxrss;
+#else
+		// NOLINTNEXTLINE(cppcoreguidelines-pro-type-union-access)
+		return resUse.ru_maxrss * kLinuxMaxrssSize;
+#endif
+	} else {
+		safs::log_error_code(errno, "could not get memory usage for chartsdata");
+		return 0;
+	}
 }
 
 void chartsdata_refresh(void) {
@@ -176,7 +206,7 @@ void chartsdata_refresh(void) {
 		procTime.it_value.tv_usec = 999999 - procTime.it_value.tv_usec;
 	} else {
 		procTime.it_value.tv_sec = 0;
-		userTime.it_value.tv_usec = 0;
+		procTime.it_value.tv_usec = 0;
 	}
 
 	userTimeMicroSeconds = toMicroSeconds(userTime);
@@ -187,6 +217,8 @@ void chartsdata_refresh(void) {
 	} else {
 		procTimeMicroSeconds = 0;
 	}
+
+	data[CHARTS_MEMORY] = GetMemUsage();
 
 	data[CHARTS_UCPU] = userTimeMicroSeconds;
 	data[CHARTS_SCPU] = procTimeMicroSeconds;
@@ -251,6 +283,13 @@ int chartsdata_init(void) {
 	it_set.it_interval.tv_usec = 0;
 	it_set.it_value.tv_sec = 999;
 	it_set.it_value.tv_usec = 999999;
+
+	// Install timer signal handlers for SIGVTALRM and SIGPROF
+	if (initializeTimerSignalHandlers(timerSignalHandler) != 0) {
+		safs::log_err("{} failed to initialize timer signal handlers", __func__);
+		return -1;
+	}
+
 	setitimer(ITIMER_VIRTUAL, &it_set, &userTime); // user time
 	setitimer(ITIMER_PROF, &it_set, &procTime);    // user time + system time
 

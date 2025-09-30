@@ -36,6 +36,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <csignal>
 #include <string>
 
 #include "common/crc.h"
@@ -1837,6 +1838,7 @@ int charts_fake_compress(uint8_t *src,uint32_t srcsize,uint8_t *dst,uint32_t *ds
 
 
 uint32_t charts_make_csv(uint32_t number) {
+	const int kNumberRangeModulus = 10;
 	uint32_t type, range;
 	uint32_t tm_year, tm_mon, tm_day, tm_hour, tm_min, tm_sec;
 	uint64_t c1dispdata[LENG];
@@ -1850,7 +1852,11 @@ uint32_t charts_make_csv(uint32_t number) {
 	tm_year = tm_mon = tm_day = tm_hour = tm_min = tm_sec = 0;
 
 	type = number / 10;
-	range = number % RANGES;
+	range = number % kNumberRangeModulus;
+	if (range >= RANGES) {
+		safs::log_warn("wrong range for chart {}", number);
+		return 0;
+	}
 	charts_filltab(c1dispdata, range, type, 1);
 	charts_filltab(c2dispdata, range, type, 2);
 	charts_filltab(c3dispdata, range, type, 3);
@@ -1991,4 +1997,27 @@ void charts_get_png(uint8_t *buff) {
 		charts_fill_crc(buff,sizeof(png_header)+compsize+sizeof(png_tailer));
 	}
 	compsize=0;
+}
+
+int initializeTimerSignalHandlers(void (*handler)(int)) {
+	struct sigaction signalAction{};
+	sigemptyset(&signalAction.sa_mask);
+	signalAction.sa_handler = handler;
+	signalAction.sa_flags = SA_RESTART;  // Automatically restart interrupted system calls
+
+	// Handle SIGPROF (ITIMER_PROF - signal 27)
+	if (sigaction(SIGPROF, &signalAction, nullptr) == -1) {
+		safs::log_err("{}: failed to install SIGPROF handler using sigaction with error {}",
+		              __func__, strerror(errno));
+		return -1;
+	}
+
+	// Handle SIGVTALRM (ITIMER_VIRTUAL - signal 26)
+	if (sigaction(SIGVTALRM, &signalAction, nullptr) == -1) {
+		safs::log_err("{}: failed to install SIGVTALRM handler using sigaction with error {}",
+		              __func__, strerror(errno));
+		return -1;
+	}
+
+	return 0;
 }
