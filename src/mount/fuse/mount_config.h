@@ -97,6 +97,8 @@ struct sfsopts_ {
 	double entrycacheto;
 	double direntrycacheto;
 	unsigned direntrycachesize;
+	unsigned negativecachetimeout;
+	unsigned negativecachesize;
 	unsigned reportreservedperiod;
 	char *iolimits;
 	int chunkserverrtt;
@@ -115,7 +117,8 @@ struct sfsopts_ {
 	double bandwidthoveruse;
 	int nonemptymount;
 	bool directio;
-    int useinodebasedwritealgorithm;
+	int useinodebasedwritealgorithm;
+	unsigned maxchunkswritteninparallelperinode;
 	int ignoreflush;
 	unsigned limitglibcmallocarenas;
 	unsigned malloctrimperiod;
@@ -125,7 +128,7 @@ struct sfsopts_ {
 	int usequotainvolumesize;
 	unsigned maxwaitretrytime;
 	unsigned mastercommsleeptimedivisor;
-
+	char *tlsconfigfile;
 	sfsopts_()
 		: masterhost(NULL),
 		masterport(NULL),
@@ -164,6 +167,8 @@ struct sfsopts_ {
 		entrycacheto(SaunaClient::FsInitParams::kDefaultEntryCacheTimeout),
 		direntrycacheto(SaunaClient::FsInitParams::kDefaultDirentryCacheTimeout),
 		direntrycachesize(SaunaClient::FsInitParams::kDefaultDirentryCacheSize),
+		negativecachetimeout(SaunaClient::FsInitParams::kDefaultNegativeCacheTo),
+		negativecachesize(SaunaClient::FsInitParams::kDefaultNegativeCacheSize),
 		reportreservedperiod(SaunaClient::FsInitParams::kDefaultReportReservedPeriod),
 		iolimits(NULL),
 		chunkserverrtt(SaunaClient::FsInitParams::kDefaultRoundTime),
@@ -182,14 +187,16 @@ struct sfsopts_ {
 		bandwidthoveruse(SaunaClient::FsInitParams::kDefaultBandwidthOveruse),
 		nonemptymount(SaunaClient::FsInitParams::kDefaultNonEmptyMounts),
 		directio(SaunaClient::FsInitParams::kDirectIO),
-        useinodebasedwritealgorithm(SaunaClient::FsInitParams::kDefaultUseInodeBasedWriteAlgorithm),
-		ignoreflush(SaunaClient::FsInitParams::kDefaultIgnoreFlush),
+		useinodebasedwritealgorithm(0), // deprecated
+		maxchunkswritteninparallelperinode(SaunaClient::FsInitParams::kDefaultMaxChunksWrittenInParallelPerInode),
+		ignoreflush(0), // deprecated
 		limitglibcmallocarenas(SaunaClient::FsInitParams::kDefaultLimitGlibcMallocArenas),
 		malloctrimperiod(SaunaClient::FsInitParams::kDefaultMallocTrimPeriod),
 		statfscachetimeout(SaunaClient::FsInitParams::kDefaultStatfsCacheTo),
 		usequotainvolumesize(SaunaClient::FsInitParams::kDefaultUseQuotaInVolumeSize),
 		maxwaitretrytime(SaunaClient::FsInitParams::kDefaultMaxWaitRetryTime),
-		mastercommsleeptimedivisor(SaunaClient::FsInitParams::kDefaultMasterCommSleepTimeDivisor)
+		mastercommsleeptimedivisor(SaunaClient::FsInitParams::kDefaultMasterCommSleepTimeDivisor),
+		tlsconfigfile(nullptr)
 	{ }
 };
 

@@ -19,13 +19,16 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <optional>
 #include <vector>
 
+#include "kv/kv_utils.h"
+
 namespace kv {
 
-using Key = std::vector<uint8_t>;
-using Value = std::vector<uint8_t>;
+class IFuture;
 
 /// Represents a key-value pair in the key-value store.
 /// Keys and values are stored as vectors of bytes.
@@ -80,9 +83,34 @@ class IReadOnlyTransaction {
 public:
 	virtual ~IReadOnlyTransaction() = default;
 
+	// Non-copyable, non-movable
+	IReadOnlyTransaction(const IReadOnlyTransaction &) = delete;
+	IReadOnlyTransaction &operator=(const IReadOnlyTransaction &) = delete;
+	IReadOnlyTransaction(IReadOnlyTransaction &&) = delete;
+	IReadOnlyTransaction &operator=(IReadOnlyTransaction &&) = delete;
+
 	/// Retrieves the value for a given key.
 	/// @param key The key to retrieve the value for.
 	virtual std::optional<Value> get(const Key &key) = 0;
+
+	/// Retrieves the value for a given key without adding it to the
+	/// transaction's read conflict range (snapshot/advisory read).
+	/// Use only when the read is advisory, for example, observing a
+	/// counter before a blind atomic write, to avoid unnecessary conflicts.
+	/// @warning Snapshot reads do not add the key to the transaction's read
+	///          conflict set and therefore provide no serializable
+	///          guarantees. Decisions based on snapshot-read values can be
+	///          invalidated by concurrent writes without causing a commit
+	///          conflict. Use get() for reads that must be transactionally
+	///          consistent.
+	/// @param key The key to retrieve the value for.
+	virtual std::optional<Value> getSnapshot(const Key &key) = 0;
+
+	/// Retrieves the value for a given key asynchronously.
+	/// @param key The key to retrieve the value for.
+	/// @return A future that will contain the value when ready.
+	/// @note The transaction must remain alive until the future's get() method is called.
+	virtual std::unique_ptr<IFuture> getAsync(const Key &key) = 0;
 
 	/// Retrieves a range of keys and values
 	/// @param start The starting key for the range.
@@ -90,6 +118,9 @@ public:
 	/// @param limit The maximum number of key-value pairs to retrieve.
 	virtual GetRangeResult getRange(const KeySelector &start, const KeySelector &end,
 	                                int limit = kDefaultGetRangeLimit) = 0;
+
+protected:
+	IReadOnlyTransaction() = default;
 };
 
 /// Interface for read-write transactions in the key-value store.
@@ -98,17 +129,39 @@ class IReadWriteTransaction : public IReadOnlyTransaction {
 public:
 	virtual ~IReadWriteTransaction() override = default;
 
+	// Non-copyable, non-movable (also removes the clang-tidy warning)
+	IReadWriteTransaction(const IReadWriteTransaction &) = delete;
+	IReadWriteTransaction &operator=(const IReadWriteTransaction &) = delete;
+	IReadWriteTransaction(IReadWriteTransaction &&) = delete;
+	IReadWriteTransaction &operator=(IReadWriteTransaction &&) = delete;
+
 	/// Sets a value for a given key.
 	/// @param key The key to set the value for.
 	/// @param value The value to set for the key.
 	virtual void set(const Key &key, const Value &value) = 0;
 
+	/// Atomically adds a delta value to the existing value for a given key.
+	/// @param key The key to add the delta to.
+	/// @param delta The delta value to add (must be little-endian).
+	virtual void atomicAdd(const Key &key, const Value &delta) = 0;
+
 	/// Removes a key from the database.
 	/// @param key The key to remove.
 	virtual void remove(const Key &key) = 0;
 
+	/// Removes a half-open key range [start, end) from the database.
+	/// @param start Inclusive start key.
+	/// @param end Exclusive end key.
+	virtual void removeRange(const Key &start, const Key &end) = 0;
+
 	/// Commits the transaction, making all changes permanent.
 	virtual bool commit() = 0;
+
+	/// Returns the committed version of the transaction, if available.
+	virtual std::optional<int64_t> getCommittedVersion() const = 0;
+
+protected:
+	IReadWriteTransaction() = default;
 };
 
 }  // namespace kv

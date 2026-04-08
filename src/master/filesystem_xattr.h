@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "common/massert.h"
+#include "common/observable_property.h"
 #include "common/type_defs.h"
 
 #define XATTR_INODE_HASH_SIZE 65536
@@ -83,9 +84,11 @@ static inline uint32_t get_xattr_data_hash(inode_t inode, uint8_t attributeNameL
 	return (hash & (XATTR_DATA_HASH_SIZE - 1));
 }
 
-static inline uint32_t get_xattr_inode_hash(inode_t inode) {
+static constexpr uint32_t get_xattr_inode_hash(inode_t inode) {
 	return ((inode * 0x72B5F387U) & (XATTR_INODE_HASH_SIZE - 1));
 }
+
+XAttributeInodeEntry *find_xattr_inode_entry(inode_t inode, uint32_t inodeHash);
 
 void xattr_checksum_add_to_background(XAttributeDataEntry *xattrDataEntry);
 void xattr_listattr_data(void *xattrInodeEntry, uint8_t *xattrDataBuffer);
@@ -100,3 +103,6 @@ uint8_t get_xattrs_length_for_inode(inode_t inode, void **xattrInodePointer, uin
 uint8_t xattr_setattr(inode_t inode, uint8_t attributeNameLength, const uint8_t *attributeName,
                       uint32_t attributeValueLength, const uint8_t *attributeValueBuffer,
                       uint8_t mode);
+
+/// Signal emitted when all xattrs for an inode are removed (node deletion cleanup).
+inline Signal<inode_t> gXAttrInodeRemovedSignal;

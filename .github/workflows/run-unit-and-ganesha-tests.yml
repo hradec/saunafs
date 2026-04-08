@@ -31,10 +31,87 @@ jobs:
             #- name: Setup a new (or from cache) vcpkg
             #  uses: lukka/run-vcpkg@v11
 
-            - name: Install nfs-ganesha v4.3 from Ubuntu repository
+            - name: Free Disk Space (Ubuntu)
+              uses: jlumbroso/free-disk-space@main
+              with:
+                  # removes all the pre-cached tools (Node, Go, Python, Ruby, ...) that are
+                  # installed in the path specified by the $AGENT_TOOLSDIRECTORY environment variable
+                  tool-cache: false          # ~6GB
+                  android: true              # ~12GB
+                  dotnet: true               # ~4GB
+                  haskell: true              # ~6GB
+                  # large-packages is the most time consuming step, enable only if really needed
+                  large-packages: false      # ~5GB (Chrome, Firefox, etc)
+                  docker-images: false       # 0B
+                  swap-storage: false        # Keep swap enabled for safety
+
+            - name: Build and install Ganesha v9.2
               run: |
-                  sudo apt update
-                  sudo apt install -y nfs-common nfs-ganesha nfs-ganesha-vfs
+                set -eux
+                # Install build dependencies
+                sudo apt update
+                sudo apt install -y --no-install-recommends \
+                    acl \
+                    bison \
+                    build-essential \
+                    byacc \
+                    cmake \
+                    dbus \
+                    docbook \
+                    docbook-xml \
+                    doxygen \
+                    fio \
+                    flex \
+                    git \
+                    krb5-user \
+                    libacl1-dev \
+                    libblkid-dev \
+                    libboost-filesystem-dev \
+                    libboost-iostreams-dev \
+                    libboost-program-options-dev \
+                    libboost-system-dev \
+                    libcap-dev \
+                    libdbus-1-dev \
+                    libgssapi-krb5-2 \
+                    libjemalloc-dev \
+                    libjudy-dev \
+                    libkrb5-dev \
+                    libkrb5support0 \
+                    libnfsidmap-dev \
+                    libnsl-dev \
+                    libsqlite3-dev \
+                    libtirpc-dev \
+                    liburcu-dev \
+                    nfs-common \
+                    pkg-config \
+                    pv \
+                    wget \
+                    unzip \
+                    rpcbind
+
+                # Clone and build Ganesha v9.2
+                cd $GITHUB_WORKSPACE
+                git clone https://github.com/nfs-ganesha/nfs-ganesha.git
+                cd nfs-ganesha
+                git checkout V9.2
+                git submodule update --recursive --init
+                mkdir build
+                cmake -B build src \
+                    -DCMAKE_C_FLAGS="-Wno-unused-function" \
+                    -DCMAKE_INSTALL_PREFIX=/usr \
+                    -DUSE_FSAL_CEPH=OFF \
+                    -DUSE_FSAL_GLUSTER=OFF \
+                    -DUSE_FSAL_GPFS=OFF \
+                    -DUSE_FSAL_KVSFS=OFF \
+                    -DUSE_FSAL_LIZARDFS=OFF \
+                    -DUSE_FSAL_LUSTRE=OFF \
+                    -DUSE_FSAL_PROXY_V3=OFF \
+                    -DUSE_FSAL_PROXY_V4=OFF \
+                    -DUSE_FSAL_RGW=OFF \
+                    -DUSE_FSAL_XFS=OFF \
+                    -DUSE_GSS=OFF \
+                    -DUSE_MONITORING=OFF
+                sudo cmake --build build --target install
 
             - name: Set up Python
               uses: actions/setup-python@v4
@@ -47,12 +124,13 @@ jobs:
                   cd $GITHUB_WORKSPACE/tests
                   sudo ./setup_machine.sh setup /mnt/hdb /mnt/hdc /mnt/hdd
 
-            - name: Cache vcpkg downloads
+            - name: Cache vcpkg
               uses: actions/cache@v4
               with:
                 path: |
+                  ~/vcpkg
                   ~/.cache/vcpkg
-                key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+                key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json', 'utils/vcpkg_setup.sh') }}
                 restore-keys: |
                   ${{ runner.os }}-vcpkg-
 
@@ -76,7 +154,7 @@ jobs:
                   -DENABLE_URAFT=ON \
                   -DGSH_CAN_HOST_LOCAL_FS=ON \
                   -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-                  -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install/saunafs/" \
+                  -DCMAKE_INSTALL_PREFIX="${GITHUB_WORKSPACE}/install/leilfs/" \
                   -DENABLE_TESTS=ON \
                   -DCODE_COVERAGE=OFF \
                   -DSAUNAFS_TEST_POINTER_OBFUSCATION=ON \

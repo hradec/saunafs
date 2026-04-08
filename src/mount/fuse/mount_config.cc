@@ -76,6 +76,8 @@ struct fuse_opt gSfsOptsStage2[] = {
 	SFS_OPT("sfsentrycacheto=%lf", entrycacheto, 0),
 	SFS_OPT("sfsdirectio=%d", directio, 0),
 	SFS_OPT("sfsdirentrycacheto=%lf", direntrycacheto, 0),
+	SFS_OPT("sfsnegativecachetimeout=%u", negativecachetimeout, 0),
+	SFS_OPT("sfsnegativecachesize=%u", negativecachesize, 0),
 	SFS_OPT("sfsaclcacheto=%lf", aclcacheto, 0),
 	SFS_OPT("sfsreportreservedperiod=%u", reportreservedperiod, 0),
 	SFS_OPT("sfsiolimits=%s", iolimits, 0),
@@ -95,8 +97,7 @@ struct fuse_opt gSfsOptsStage2[] = {
 	SFS_OPT("bandwidthoveruse=%lf", bandwidthoveruse, 1),
 	SFS_OPT("sfsdirentrycachesize=%u", direntrycachesize, 0),
 	SFS_OPT("nostdmountoptions", nostdmountoptions, 1),
-	SFS_OPT("sfsuseinodebasedwritealgorithm=%d", useinodebasedwritealgorithm, 0),
-	SFS_OPT("sfsignoreflush=%d", ignoreflush, 0),
+	SFS_OPT("sfsmaxchunkswritteninparallelperinode=%u", maxchunkswritteninparallelperinode, 0),
 	SFS_OPT("limitglibcmallocarenas=%d", limitglibcmallocarenas, 0),
 	SFS_OPT("malloctrimperiod=%d", malloctrimperiod, 0),
 	SFS_OPT("sfslognotificationarea=%d", lognotificationarea, 0),
@@ -105,6 +106,12 @@ struct fuse_opt gSfsOptsStage2[] = {
 	SFS_OPT("usequotainvolumesize=%d", usequotainvolumesize, 0),
 	SFS_OPT("maxwaitretrytime=%u", maxwaitretrytime, 0),
 	SFS_OPT("mastercommsleeptimedivisor=%u", mastercommsleeptimedivisor, 0),
+	SFS_OPT("tlsconfigfile=%s", tlsconfigfile, 0),
+
+	// Leaving it only to consume the option if provided, as it is not used in the codebase and may
+	// prevent the client from starting if set and not consumed.
+	SFS_OPT("sfsignoreflush=%d", ignoreflush, 0),
+	SFS_OPT("sfsuseinodebasedwritealgorithm=%d", useinodebasedwritealgorithm, 0),
 
 	SFS_OPT("enablefilelocks=%u", filelocks, 0),
 	SFS_OPT("nonempty", nonemptymount, 1),
@@ -144,8 +151,12 @@ void initialize_opts_name_values() {
 	gOptsNameValues["sfscacheperinodepercentage"] =
 	    std::to_string(gMountOptions.cachePerInodePercentage);
 	gOptsNameValues["sfswriteworkers"] = std::to_string(gMountOptions.writeworkers);
-	gOptsNameValues["sfsuseinodebasedwritealgorithm"] =
-	    std::to_string(gMountOptions.useinodebasedwritealgorithm);
+	if (gMountOptions.useinodebasedwritealgorithm != 0) {
+		gOptsNameValues["sfsuseinodebasedwritealgorithm (deprecated, ignored)"] =
+		    std::to_string(gMountOptions.useinodebasedwritealgorithm);
+	}
+	gOptsNameValues["sfsmaxchunkswritteninparallelperinode"] =
+	    std::to_string(gMountOptions.maxchunkswritteninparallelperinode);
 	gOptsNameValues["sfsioretries (read)"] = std::to_string(gMountOptions.ioretries);
 	gOptsNameValues["sfsioretries (write)"] = std::to_string(gMountOptions.ioretries);
 	gOptsNameValues["sfswritewindowsize"] = std::to_string(gMountOptions.writewindowsize);
@@ -167,6 +178,8 @@ void initialize_opts_name_values() {
 	gOptsNameValues["sfsentrycacheto"] = std::to_string(gMountOptions.entrycacheto);
 	gOptsNameValues["sfsdirectio"] = std::to_string(gMountOptions.directio);
 	gOptsNameValues["sfsdirentrycacheto"] = std::to_string(gMountOptions.direntrycacheto);
+	gOptsNameValues["sfsnegativecachetimeout"] = std::to_string(gMountOptions.negativecachetimeout);
+	gOptsNameValues["sfsnegativecachesize"] = std::to_string(gMountOptions.negativecachesize);
 	gOptsNameValues["sfsaclcacheto"] = std::to_string(gMountOptions.aclcacheto);
 	gOptsNameValues["sfsreportreservedperiod"] = std::to_string(gMountOptions.reportreservedperiod);
 	gOptsNameValues["sfsiolimits"] =
@@ -195,7 +208,10 @@ void initialize_opts_name_values() {
 	gOptsNameValues["bandwidthoveruse"] = std::to_string(gMountOptions.bandwidthoveruse);
 	gOptsNameValues["sfsdirentrycachesize"] = std::to_string(gMountOptions.direntrycachesize);
 	gOptsNameValues["nostdmountoptions"] = std::to_string(gMountOptions.nostdmountoptions);
-	gOptsNameValues["sfsignoreflush"] = std::to_string(gMountOptions.ignoreflush);
+	if (gMountOptions.ignoreflush != 0) {
+		gOptsNameValues["sfsignoreflush (deprecated, ignored)"] =
+		    std::to_string(gMountOptions.ignoreflush);
+	}
 	gOptsNameValues["limitglibcmallocarenas"] =
 	    std::to_string(gMountOptions.limitglibcmallocarenas);
 	gOptsNameValues["malloctrimperiod"] = std::to_string(gMountOptions.malloctrimperiod);
@@ -209,6 +225,8 @@ void initialize_opts_name_values() {
 	    std::to_string(gMountOptions.mastercommsleeptimedivisor);
 	gOptsNameValues["enablefilelocks"] = std::to_string(gMountOptions.filelocks);
 	gOptsNameValues["nonempty"] = std::to_string(gMountOptions.nonemptymount);
+	gOptsNameValues["tlsconfigfile"] =
+	    gMountOptions.tlsconfigfile ? std::string(gMountOptions.tlsconfigfile) : "";
 
 	gMountInfo.setMountOptions(gOptsNameValues);
 }
@@ -275,13 +293,9 @@ void usage(const char *progname) {
 "    -o sfswriteworkers=N        define number of write workers (default: %u)\n"
 "    -o sfswritewindowsize=N     define write window size (in blocks) for "
 				"each chunk (default: %u)\n"
-"    -o sfsuseinodebasedwritealgorithm=0|1  use inode based write algorithm when "
-				"set to 1. Use chunk based write algorithm when set to 0 "
-				"(default: %d)\n"
-"    -o sfsignoreflush=0|1       Advanced: use with caution. Ignore flush usual "
-				"behavior by replying SUCCESS to it immediately. Targets fast "
-				"creation of small files, but may cause data loss during crashes "
-				"(default: %d)\n"
+"    -o sfsmaxchunkswritteninparallelperinode=N  define the maximum number of chunks "
+				"that can be written in parallel per inode. 0 stands for unlimited "
+				"(default: %u)\n"
 "\n"
 "Other options:\n"
 "    -m   --meta                 equivalent to '-o sfsmeta'\n"
@@ -314,6 +328,14 @@ void usage(const char *progname) {
 				"(default: %.2f)\n"
 "    -o sfsdirentrycachesize=N   define directory entry cache size in number "
 				"of entries (default: %u)\n"
+"    -o sfsnegativecachetimeout=MSEC  set negative cache timeout to determine "
+				"how long client remembers a failed lookup. When equal to 0 "
+    			"disabled for both internal and Linux kernel-level negative caching. " 
+				"If changed in .saunafs_tweaks clears the whole cache (default: %u)\n"
+"    -o sfsnegativecachesize=N   define internal negative cache max size in number of entries. "
+				"Prevents network requests if the kernel evicts entries early. "
+				"When equal to 0 disabled for both internal and Linux kernel-level negative caching. "
+				"If changed in .saunafs_tweaks clears the whole cache (default: %u)\n"
 "    -o sfsaclcacheto=SEC        set ACL cache timeout in seconds (default: %.2f)\n"
 "    -o sfsreportreservedperiod=SEC  set reporting reserved inodes interval in "
 				"seconds (default: %u)\n"
@@ -362,6 +384,8 @@ void usage(const char *progname) {
 "    -o mastercommsleeptimedivisor=N  number of retries between each time increase of the "
 				"master-communication sleep interval, up to maxwaitretrytime; smaller N "
 				"converges faster—ideal for critical fast-reconnect scenarios (default: %u)\n"
+"    -o tlsconfigfile=PATH       path to the file with client config TLS option values "
+				"used to authenticate the master server (default: %s)\n"
 "\n",
 		SaunaClient::FsInitParams::kDefaultCacheExpirationTime,
 		SaunaClient::FsInitParams::kDefaultReadBuffersExpirationTime,
@@ -378,8 +402,7 @@ void usage(const char *progname) {
 		SaunaClient::FsInitParams::kDefaultCachePerInodePercentage,
 		SaunaClient::FsInitParams::kDefaultWriteWorkers,
 		SaunaClient::FsInitParams::kDefaultWriteWindowSize,
-		SaunaClient::FsInitParams::kDefaultUseInodeBasedWriteAlgorithm,
-		SaunaClient::FsInitParams::kDefaultIgnoreFlush,
+		SaunaClient::FsInitParams::kDefaultMaxChunksWrittenInParallelPerInode,
 		SaunaClient::FsInitParams::kDefaultUseRwLock,
 		SaunaClient::FsInitParams::kDefaultMkdirCopySgid,
 		sugidClearModeString(SaunaClient::FsInitParams::kDefaultSugidClearMode),
@@ -387,6 +410,8 @@ void usage(const char *progname) {
 		SaunaClient::FsInitParams::kDefaultEntryCacheTimeout,
 		SaunaClient::FsInitParams::kDefaultDirentryCacheTimeout,
 		SaunaClient::FsInitParams::kDefaultDirentryCacheSize,
+		SaunaClient::FsInitParams::kDefaultNegativeCacheTo,
+		SaunaClient::FsInitParams::kDefaultNegativeCacheSize,
 		SaunaClient::FsInitParams::kDefaultAclCacheTimeout,
 		SaunaClient::FsInitParams::kDefaultReportReservedPeriod,
 		SaunaClient::FsInitParams::kDefaultRoundTime,
@@ -402,7 +427,8 @@ void usage(const char *progname) {
 		SaunaClient::FsInitParams::kDefaultStatfsCacheTo,
 		SaunaClient::FsInitParams::kDefaultUseQuotaInVolumeSize,
 		SaunaClient::FsInitParams::kDefaultMaxWaitRetryTime,
-		SaunaClient::FsInitParams::kDefaultMasterCommSleepTimeDivisor
+		SaunaClient::FsInitParams::kDefaultMasterCommSleepTimeDivisor,
+		SaunaClient::FsInitParams::kDefaultTlsConfigFile.data()
 	);
 	printf(
 "CMODE can be set to:\n"

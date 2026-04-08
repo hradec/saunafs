@@ -22,11 +22,18 @@
 #include <sys/poll.h>
 #include <thread>
 
+#include "common/slice_traits.h"
+
 #include "gtest/gtest.h"
 
 void mockJobCallback(uint8_t  /*status*/, void *extra) {
 	auto *counter = static_cast<std::atomic<int> *>(extra);
 	counter->fetch_add(1);
+}
+
+void mockJobCallbackDoubling(uint8_t  /*status*/, void *extra) {
+	auto *counter = static_cast<std::atomic<int> *>(extra);
+	counter->fetch_add(counter->load());
 }
 
 constexpr uint32_t kWaitTimeMs = 100;
@@ -35,13 +42,30 @@ constexpr uint32_t kWaitTimeMs = 100;
 class JobPoolTest : public ::testing::Test {
 private:
 	void servePoll(uint32_t listenerId) {
-		struct pollfd wakeupDescPollFd = {wakeupDescVec[listenerId], POLLIN, 0};
+		std::vector<pollfd> wakeupDescPollFDs = {
+		    pollfd{wakeupDescVec[listenerId], POLLIN, 0},
+		    pollfd{masterWakeupDescVec[listenerId], POLLIN, 0},
+		    pollfd{clientSwitchModeWakeupDescVec[listenerId], POLLIN, 0},
+		    pollfd{clientFifoModeWakeupDescVec[listenerId], POLLIN, 0}};
+
 		while (!terminate) {
-			int ret = poll(&wakeupDescPollFd, 1, kWaitTimeMs);
+			int ret = poll(&wakeupDescPollFDs[0], wakeupDescPollFDs.size(), kWaitTimeMs);
 			if (ret > 0) {
-				if (wakeupDescPollFd.revents & POLLIN) {
+				if (wakeupDescPollFDs[0].revents & POLLIN) {
 					processingCount[listenerId].fetch_add(1);
 					jobPool->processCompletedJobs(listenerId);
+				}
+				if (wakeupDescPollFDs[1].revents & POLLIN) {
+					processingCount[listenerId].fetch_add(1);
+					masterJobPool->processCompletedJobs(listenerId);
+				}
+				if (wakeupDescPollFDs[2].revents & POLLIN) {
+					processingCount[listenerId].fetch_add(1);
+					clientJobPoolSwitch->processCompletedJobs(listenerId);
+				}
+				if (wakeupDescPollFDs[3].revents & POLLIN) {
+					processingCount[listenerId].fetch_add(1);
+					clientJobPoolFifo->processCompletedJobs(listenerId);
 				}
 			}
 		}
@@ -52,6 +76,24 @@ protected:
 		// Let's create some listeners for the JobPool
 		wakeupDescVec.resize(kNrListeners);
 		jobPool = std::make_unique<JobPool>("TestPool", 4, 10, kNrListeners, wakeupDescVec);
+		jobPool->startWorkers();
+
+		masterWakeupDescVec.resize(kNrListeners);
+		masterJobPool = std::make_unique<MasterJobPool>("TestMasterPool", 4, 10, kNrListeners,
+		                                                masterWakeupDescVec);
+
+		// For the ClientJobPool, we want to test both IOPriorityMode::Fifo and
+		// IOPriorityMode::Switch, so we will initialize it in the test cases instead of here. For
+		// now, we can just initialize it with Switch mode as default.
+		clientSwitchModeWakeupDescVec.resize(kNrListeners);
+		clientJobPoolSwitch =
+		    std::make_unique<ClientJobPool>("TestClientPoolSwitch", 1, 10, kNrListeners,
+		                                    clientSwitchModeWakeupDescVec, IOPriorityMode::Switch);
+		clientFifoModeWakeupDescVec.resize(kNrListeners);
+		clientJobPoolFifo =
+		    std::make_unique<ClientJobPool>("TestClientPoolFifo", 1, 10, kNrListeners,
+		                                    clientFifoModeWakeupDescVec, IOPriorityMode::Fifo);
+
 		for (uint32_t i = 0; i < kNrListeners; ++i) {
 			processingCount[i] = 0;
 		}
@@ -87,11 +129,19 @@ protected:
 	}
 
 	JobPool::ProcessJobCallback mockProcessJob = []() -> uint8_t {
+		usleep(1000);  // Simulate some work by sleeping for 1ms
 		return 0;  // Return success status
 	};
 
 	std::unique_ptr<JobPool> jobPool;
 	std::vector<int> wakeupDescVec;
+	std::unique_ptr<MasterJobPool> masterJobPool;
+	std::vector<int> masterWakeupDescVec;
+	std::unique_ptr<ClientJobPool> clientJobPoolSwitch;
+	std::vector<int> clientSwitchModeWakeupDescVec;
+	std::unique_ptr<ClientJobPool> clientJobPoolFifo;
+	std::vector<int> clientFifoModeWakeupDescVec;
+
 	std::vector<std::thread> servePollThreads;
 	bool terminate;
 	std::mutex mutex_;
@@ -218,4 +268,122 @@ TEST_F(JobPoolTest, JobStatusHandling) {
 	for (uint32_t i = 0; i < kNrOperationTypes; ++i) {
 		EXPECT_EQ(counters[i].load(), 1);  // Each job should have been processed once
 	}
+}
+
+TEST_F(JobPoolTest, ChunkLocking) {
+	const uint64_t chunkId1 = 12345;
+	const uint64_t chunkId2 = 123456;
+	const uint64_t chunkId3 = 1234567;
+	const uint64_t chunkId4 = 12345678;
+	const ChunkPartType chunkType = slice_traits::standard::ChunkPartType();
+	ChunkWithType chunkWithType1{chunkId1, chunkType};
+	ChunkWithType chunkWithType2{chunkId2, chunkType};
+	ChunkWithType chunkWithType3{chunkId3, chunkType};
+	ChunkWithType chunkWithType4{chunkId4, chunkType};
+
+	masterJobPool->startChunkLock(mockJobCallback, &counters[0], chunkId1, chunkType, 0);
+	masterJobPool->startChunkLock(mockJobCallback, &counters[0], chunkId2, chunkType, 0);
+	masterJobPool->startChunkLock(mockJobCallback, nullptr, chunkId4, chunkType, 0);
+	masterJobPool->enforceChunkLock(chunkId1, chunkType);
+	masterJobPool->enforceChunkLock(chunkId4, chunkType);
+
+	masterJobPool->addJobIfNotLocked(chunkWithType1, JobPool::ChunkOperation::Read, mockJobCallback,
+	                                 &counters[0], mockProcessJob);
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+	// Job should not be processed because chunk is locked and enforced
+	EXPECT_EQ(counters[0].load(), 0);
+
+	masterJobPool->addJobIfNotLocked(chunkWithType2, JobPool::ChunkOperation::Read, mockJobCallback,
+	                                 &counters[0], mockProcessJob);
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+	// Job should be processed because chunk is locked but not enforced
+	EXPECT_EQ(counters[0].load(), 1);
+
+	masterJobPool->addJobIfNotLocked(chunkWithType3, JobPool::ChunkOperation::Read, mockJobCallback,
+	                                 &counters[0], mockProcessJob);
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+	// Job should be processed because chunk is not locked
+	EXPECT_EQ(counters[0].load(), 2);
+
+	masterJobPool->addJobIfNotLocked(chunkWithType4, JobPool::ChunkOperation::Read, mockJobCallback,
+	                                 &counters[0], mockProcessJob);
+	masterJobPool->addJobIfNotLocked(chunkWithType4, JobPool::ChunkOperation::Read, mockJobCallback,
+	                                 &counters[0], mockProcessJob);
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+	// Job should not be processed because chunk is locked and enforced
+	EXPECT_EQ(counters[0].load(), 2);
+
+	masterJobPool->endChunkLock(chunkId1, chunkType, SAUNAFS_STATUS_OK);
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+	// Now the job for chunkWithType1 should be processed because the lock is released and the
+	// callback for the lock job should be called
+	EXPECT_EQ(counters[0].load(), 4);
+
+	masterJobPool->endChunkLock(chunkId2, chunkType, SAUNAFS_STATUS_OK);
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+	// Now the callback for the lock job of chunkWithType2 should be called
+	EXPECT_EQ(counters[0].load(), 5);
+
+	masterJobPool->eraseChunkLock(chunkId4, chunkType);
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+	// Now the jobs for chunkWithType4 should be processed because the lock is released, but the
+	// callback for the lock job should not be called
+	EXPECT_EQ(counters[0].load(), 7);
+}
+
+TEST_F(JobPoolTest, IOPriorityMode) {
+	const int kInitialSwitchCounterValue = 5;
+	const int kInitialFifoCounterValue = 7;
+	counters[0] = kInitialSwitchCounterValue;
+	counters[1] = kInitialFifoCounterValue;
+
+	// Add a series of Read and Write jobs to the ClientJobPool in Switch mode and check the
+	// processing order by the final value.
+	for (int i = 0; i < 5; ++i) {
+		clientJobPoolSwitch->addJob(JobPool::ChunkOperation::Read, mockJobCallback, &counters[0],
+		                            mockProcessJob);
+	}
+	for (int i = 0; i < 5; ++i) {
+		clientJobPoolSwitch->addJob(JobPool::ChunkOperation::Write, mockJobCallbackDoubling,
+		                            &counters[0], mockProcessJob);
+	}
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+
+	// In Switch mode, the Read and Write jobs should be processed in an alternating manner, so
+	// the final value should reflect the interleaving of the operations.
+	int switchCounterExpectedFinalValue = kInitialSwitchCounterValue;
+	for (int i = 0; i < 5; ++i) {
+		// Each Read job adds 1, and each Write job doubles the current value.
+		switchCounterExpectedFinalValue = (switchCounterExpectedFinalValue + 1) * 2;
+	}
+
+	EXPECT_EQ(counters[0].load(), switchCounterExpectedFinalValue);
+
+	// Add a series of Read and Write jobs to the ClientJobPool in Fifo mode and check the
+	// processing order by the final value.
+	for (int i = 0; i < 5; ++i) {
+		clientJobPoolFifo->addJob(JobPool::ChunkOperation::Read, mockJobCallback, &counters[1],
+		                          mockProcessJob);
+	}
+	for (int i = 0; i < 5; ++i) {
+		clientJobPoolFifo->addJob(JobPool::ChunkOperation::Write, mockJobCallbackDoubling,
+		                          &counters[1], mockProcessJob);
+	}
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(kWaitTimeMs));
+
+	// In Fifo mode, the Read jobs should be processed first followed by the Write jobs, so the
+	// final value should reflect the sequential processing of the operations.
+	int fifoCounterExpectedFinalValue = kInitialFifoCounterValue;
+	for (int i = 0; i < 5; ++i) {
+		// Each Read job adds 1.
+		fifoCounterExpectedFinalValue++;
+	}
+	for (int i = 0; i < 5; ++i) {
+		// Each Write job doubles the current value.
+		fifoCounterExpectedFinalValue *= 2;
+	}
+
+	EXPECT_EQ(counters[1].load(), fifoCounterExpectedFinalValue);
 }

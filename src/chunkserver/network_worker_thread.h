@@ -33,6 +33,7 @@
 inline std::atomic<uint16_t> gMaxParallelHddReadJobsPerCsEntry;
 inline std::atomic<uint16_t> gMaxBlocksPerHddReadJob;
 inline std::atomic<uint16_t> gMaxBlocksPerHddWriteJob;
+inline std::atomic<uint32_t> gWriteBufferingSize_mb;
 
 class NetworkWorkerThread {
 public:
@@ -40,9 +41,10 @@ public:
 	static constexpr uint32_t kDefaultNumberOfHddWorkersPerNetworkWorker = 16;
 	static constexpr uint32_t kDefaultMaxBackgroundJobsPerNetworkWorker = 4000;
 
-	static constexpr uint16_t kDefaultMaxParallelHddReadJobsPerCsEntry = 16;
-	static constexpr uint16_t kDefaultMaxBlocksPerHddReadJob = 8;
+	static constexpr uint16_t kDefaultMaxParallelHddReadJobsPerCsEntry = 1;
+	static constexpr uint16_t kDefaultMaxBlocksPerHddReadJob = 16;
 
+	static constexpr uint32_t kDefaultWriteBufferingSize_mb = 0;
 	static constexpr uint16_t kDefaultMaxBlocksPerHddWriteJob = 16;
 	static constexpr uint16_t kMinBlocksPerHddWriteJob = 1;
 	static constexpr uint16_t kMaxBlocksPerHddWriteJob = 64;
@@ -55,26 +57,29 @@ public:
 	void askForTermination();
 	void addConnection(int newSocketFD);
 
-	JobPool *backgroundJobPool() {
+	ClientJobPool *backgroundJobPool() {
 		return bgJobPool_.get();
 	}
 
+	bool updateAndCheckTerminationStatus();
+
 private:
-	void preparePollFds();
-	void servePoll() ;
+	void preparePollFds(bool isTerminating);
+	void servePoll();
 	void terminate();
 
 	/// Human readable name for the thread
 	std::string name_;
 
-	std::atomic<bool> doTerminate;
+	std::atomic<bool> doTerminate;  ///< Whether the thread should terminate
 	std::mutex csservheadLock;
 	std::list<ChunkserverEntry> csservEntries;
 
-	std::unique_ptr<JobPool> bgJobPool_;
+	std::unique_ptr<ClientJobPool> bgJobPool_;
+	std::atomic<bool> canTerminate_{false};  ///< Whether it is safe to terminate the thread
 	int bgJobPoolWakeUpFd_;
 	static const uint32_t JOB_FD_PDESC_POS = 1;
 	std::vector<struct pollfd> pdesc;
 	int notify_pipe[2];
+	Timer terminationTimer_{};
 };
-

@@ -18,6 +18,7 @@
 
 #include "common/platform.h"
 
+#include <cstdint>
 #include "chunkserver-common/hdd_stats.h"
 
 #include "chunkserver-common/disk_interface.h"
@@ -41,6 +42,7 @@ static inline void totalRead(IDisk *disk, uint64_t size, MicroSeconds duration) 
 
 	gStatsTotalOperationsRead++;
 	gStatsTotalBytesRead += size;
+	gBytesReadSinceLastGCSweep += size;
 	gStatsTotalTimeRead += duration;
 
 	auto &diskStats = disk->getCurrentStats();
@@ -60,6 +62,7 @@ static inline void totalWrite(IDisk *disk, uint64_t size,
 
 	gStatsTotalOperationsWrite++;
 	gStatsTotalBytesWrite += size;
+	gBytesWrittenSinceLastGCSweep += size;
 	gStatsTotalTimeWrite += duration;
 
 	auto &diskStats = disk->getCurrentStats();
@@ -83,10 +86,9 @@ void stats(statsReport report) {
 	*report.totalWriteTime = gStatsTotalTimeWrite.exchange(0);
 }
 
-void operationStats(uint32_t *opsCreate, uint32_t *opsDelete,
-                    uint32_t *opsUpdateVersion, uint32_t *opsDuplicate,
-                    uint32_t *opsTruncate, uint32_t *opsDupTrunc,
-                    uint32_t *opsTest) {
+void operationStats(uint32_t *opsCreate, uint32_t *opsDelete, uint32_t *opsUpdateVersion,
+                    uint32_t *opsDuplicate, uint32_t *opsTruncate, uint32_t *opsDupTrunc,
+                    uint32_t *opsTest, uint32_t *opsGCPurge) {
 	TRACETHIS();
 	*opsCreate = gStatsOperationsCreate.exchange(0);
 	*opsDelete = gStatsOperationsDelete.exchange(0);
@@ -95,6 +97,16 @@ void operationStats(uint32_t *opsCreate, uint32_t *opsDelete,
 	*opsDuplicate = gStatsOperationsDuplicate.exchange(0);
 	*opsTruncate = gStatsOperationsTruncate.exchange(0);
 	*opsDupTrunc = gStatsOperationsDupTrunc.exchange(0);
+	*opsGCPurge = gStatsOperationsGCPurge.exchange(0);
+}
+
+void getSpaceDeltaStats(int64_t *spaceDelta) {
+	TRACETHIS();
+	const uint64_t lastReadUsedSpace = gStatsLastReadUsedSpace.load();
+	const uint64_t previousReadUsedSpace = gStatsPreviousReadUsedSpace.exchange(lastReadUsedSpace);
+	*spaceDelta = (previousReadUsedSpace == 0)
+	                  ? 0
+	                  : int64_t(lastReadUsedSpace) - int64_t(previousReadUsedSpace);
 }
 
 void overheadRead(uint32_t size) {

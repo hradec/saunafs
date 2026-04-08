@@ -18,13 +18,15 @@
 
 #pragma once
 
-#define FDB_API_VERSION 730
+#include "common/platform.h"
 
-#include <foundationdb/fdb_c.h>
-#include <foundationdb/fdb_c_types.h>
-
+#include <cstdint>
 #include <memory>
 #include <string>
+
+#include <fdb/fdb_api_version.h>  // Needs to be included before foundationdb/fdb_c.h
+#include <foundationdb/fdb_c.h>
+#include <foundationdb/fdb_c_types.h>
 
 #include "kv/itransaction.h"
 
@@ -118,6 +120,17 @@ private:
 	fdb_error_t error_ = 1;  ///< The error code of the last operation.
 };
 
+/// Custom deleter for FDBFuture (C struct), to ensure proper cleanup.
+struct FDBFutureDeleter {
+	constexpr FDBFutureDeleter() noexcept = default;
+	void operator()(FDBFuture *fut) const {
+		if (fut != nullptr) { fdb_future_destroy(fut); }
+	}
+};
+
+/// Owning handle for an FDBFuture; automatically destroyed on scope exit.
+using UniqueFDBFuture = std::unique_ptr<FDBFuture, FDBFutureDeleter>;
+
 /// A class that wraps a FoundationDB transaction.
 /// Provides methods to perform read and write operations on the database.
 class Transaction {
@@ -141,6 +154,13 @@ public:
 	/// @param key The key to retrieve the value for.
 	std::optional<kv::Value> get(const kv::Key &key, bool snapshot = false);
 
+	/// Gets a value for a given key asynchronously.
+	/// @param key The key to retrieve the value for.
+	/// @param snapshot Whether to use a snapshot for the transaction.
+	/// @return A future that will contain the value when ready.
+	/// @note The transaction must remain alive until the future's get() method is called.
+	std::unique_ptr<kv::IFuture> getAsync(const kv::Key &key, bool snapshot = false);
+
 	/// Gets a range of keys and values.
 	/// @param begin The starting key for the range.
 	/// @param end The ending key for the range.
@@ -161,13 +181,25 @@ public:
 	/// @param value The value to set for the key.
 	void set(const kv::Key &key, const kv::Value &value);
 
+	/// Atomically adds a delta value to the existing value for a given key.
+	/// @param key The key to add the delta to.
+	/// @param delta The delta value to add.
+	void atomicAdd(const kv::Key &key, const kv::Value &delta);
+
 	/// Removes a key from the database.
 	/// @param key The key to remove.
 	void remove(const kv::Key &key);
 
+	/// Removes a half-open key range [start, end) from the database.
+	void removeRange(const kv::Key &start, const kv::Key &end);
+
 	/// Commits the transaction.
 	/// @return True if the commit was successful, false otherwise.
 	bool commit();
+
+	/// Gets the committed version of the transaction.
+	/// @return The committed version, if available.
+	std::optional<int64_t> getCommittedVersion() const { return committedVersion_; }
 
 private:
 	/// Custom deleter for FDBTransaction (C struct), to ensure proper cleanup.
@@ -182,6 +214,9 @@ private:
 	std::unique_ptr<FDBTransaction, FDBTransactionDeleter> tr_;
 	/// The error code of the last operation.
 	fdb_error_t error_{1};
+
+	/// The commit version of the transaction, if applicable.
+	std::optional<int64_t> committedVersion_;
 };
 
 }  // namespace fdb

@@ -26,7 +26,7 @@
 #include "master/filesystem_checksum.h"
 #include "master/filesystem_checksum_background_updater.h"
 #include "master/filesystem_metadata.h"
-#include "master/filesystem_operations.h"
+#include "master/filesystem_operations_interface.h"
 
 #ifndef METARESTORE
 
@@ -53,9 +53,15 @@ protected:
 	static void writeToChangelog(uint32_t ts) {
 		lastEntry_ = gMetadata->metadataVersion;
 		if (metadataserver::isMaster() && !gChecksumBackgroundUpdater.inProgress()) {
+			// The checksum updater is not used by KV/MDS backends, which do not rely on
+			// changelog-based checksumming. The fsOpContext here is a placeholder to satisfy
+			// the updated changeLog() signature; no transaction commit is needed.
+			auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+			    FilesystemOperationContext::TransactionType::kReadWrite);
 			std::string versionString = saunafsVersionToString(SAUNAFS_VERSHEX);
-			uint64_t checksum = fs_checksum(ChecksumMode::kGetCurrent);
-			fs_changelog(ts, "CHECKSUM(%s):%" PRIu64, versionString.c_str(), checksum);
+			uint64_t checksum = gFSOperations->metadataChecksum(ChecksumMode::kGetCurrent);
+			gFSOperations->changeLog(fsOpContext, ts, "CHECKSUM(%s):%" PRIu64,
+			                         versionString.c_str(), checksum);
 		}
 	}
 

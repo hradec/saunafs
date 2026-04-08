@@ -38,6 +38,7 @@
 #include "chunkserver/bgjobs.h"
 #include "chunkserver/hddspacemgr.h"
 #include "chunkserver/master_connection.h"
+#include "chunkserver/network_main_thread.h"
 #include "common/event_loop.h"
 #include "common/massert.h"
 #include "common/network_address.h"
@@ -57,8 +58,8 @@ static bool gEnableLoadFactor;
 static const uint64_t kSendStatusDelay = 5;
 
 //  JobPool shared between all connections to MDSs
-static std::shared_ptr<JobPool> gJobPool;
-static std::shared_ptr<JobPool> gReplicationJobPool;
+static std::shared_ptr<MasterJobPool> gJobPool;
+static std::shared_ptr<MasterJobPool> gReplicationJobPool;
 
 //  Singleton for the MasterConn instance (will become a list of connections in the future)
 static std::unique_ptr<MasterConn> gMasterConnSingleton = nullptr;
@@ -100,7 +101,8 @@ void masterconn_stats(uint64_t *bin,uint64_t *bout,uint32_t *maxjobscnt) {
 void masterconn_check_hdd_reports() {
 	MasterConn *eptr = gMasterConnSingleton.get();
 	uint32_t errorcounter;
-	if (eptr->mode() == ConnectionMode::CONNECTED) {
+	if (eptr->mode() == ConnectionMode::CONNECTED &&
+	    eptr->registrationStatus() == RegistrationStatus::kChunksRegistered) {
 		if (hddGetAndResetSpaceChanged()) {
 			uint64_t usedspace, totalspace, tdusedspace, tdtotalspace;
 			uint32_t chunkcount, tdchunkcount;
@@ -139,6 +141,51 @@ void masterconn_unwantedjobfinished(uint8_t status, void *packet) {
 	MasterConn::deletePacket(packet);
 }
 
+std::function<void(uint8_t, void *)> masterconn_jobDeleteAfterErrorFinished(
+    ChunkWithType chunkWithType) {
+	return [chunkWithType](uint8_t status, void *packet) {
+		(void)packet;
+		// packet should be nullptr
+
+		if (status == SAUNAFS_STATUS_OK &&
+		    gMasterConnSingleton->mode() == ConnectionMode::CONNECTED) {
+			// Report the chunk as lost to the master server, so it won't be registered again and
+			// won't cause any inconsistencies. If the mode is connected, it means that registration
+			// with the master server was successful, so we can safely report the chunk as lost. If
+			// the mode is not connected, it means that registration with the master server was not
+			// successful, so we can skip reporting the chunk as lost, as it won't be registered
+			// anyway.
+			hddReportLostChunk(chunkWithType.id, chunkWithType.type);
+		}
+	};
+}
+
+std::function<void(uint8_t, void *)> masterconn_unwantedLockJobFinished(
+    ChunkWithType chunkWithType, uint32_t listenerId) {
+	return [chunkWithType, listenerId](uint8_t status, void *packet) {
+		MasterConn::deletePacket(packet);
+
+		if (status == SAUNAFS_STATUS_OK) { return; }
+
+		// If there was an error while writing, which is passed to the callback as status, we want
+		// to remove the chunk itself and avoid registering it again with the master server, as it
+		// might contain broken data. To do that, we add a delete job to the job pool, which will be
+		// processed and will remove the chunk from the chunk server.
+		job_delete(*gJobPool, masterconn_jobDeleteAfterErrorFinished(chunkWithType), nullptr,
+		           chunkWithType.id, 0, chunkWithType.type, listenerId);
+	};
+}
+
+MasterJobPool* masterconn_get_job_pool() {
+	return gJobPool.get();
+}
+
+bool masterconn_canexit() {
+	return gMasterConnSingleton->mode() != ConnectionMode::CONNECTED ||
+	       (gJobPool->isEmpty() && gReplicationJobPool->isEmpty() &&
+	        gMasterConnSingleton->isOutputQueueEmpty());
+}
+
 void masterconn_term(void) {
 	//  For each connection (currently only one), release its resources.
 	MasterConn *eptr = gMasterConnSingleton.get();
@@ -171,7 +218,7 @@ void masterconn_desc(std::vector<pollfd> &pdesc) {
 		}
 	}
 
-	eptr->providePollDescriptors(pdesc);
+	eptr->providePollDescriptors(pdesc, doTerminate());
 }
 
 void masterconn_send_status() {
@@ -217,6 +264,7 @@ void masterconn_serve(const std::vector<pollfd> &pdesc) {
 	// If the connection is in KILL mode, disable the job pool and close the socket.
 	if (eptr->mode() == ConnectionMode::KILL) {
 		gJobPool->disableAndChangeCallbackAll(masterconn_unwantedjobfinished);
+		gJobPool->changeLockJobsCallback(masterconn_unwantedLockJobFinished);
 		gReplicationJobPool->disableAndChangeCallbackAll(masterconn_unwantedjobfinished);
 		tcpclose(eptr->socketFD());
 		eptr->resetPackets();
@@ -307,6 +355,7 @@ int masterconn_init(void) {
 	gReconnectHook =
 	    eventloop_timeregister(TIMEMODE_RUN_LATE, reconnectionDelay,
 	                           rnd_ranged<uint32_t>(reconnectionDelay), masterconn_reconnect);
+
 	eventloop_destructregister(masterconn_term);
 	eventloop_pollregister(masterconn_desc, masterconn_serve);
 	eventloop_reloadregister(masterconn_reload);
@@ -322,8 +371,8 @@ int masterconn_init_threads(void) {
 		// Create the JobPool instance with the specified number of workers, it would be serving
 		// only this master network thread, thus the number of listeners is 1.
 		std::vector<int> bgJobPoolFDs(1);
-		gJobPool = std::make_shared<JobPool>("ma", gNumberOfWorkers, kMaxBackgroundJobsCount, 1,
-		                                     bgJobPoolFDs);
+		gJobPool = std::make_shared<MasterJobPool>("ma", gNumberOfWorkers, kMaxBackgroundJobsCount,
+		                                           1, bgJobPoolFDs);
 		gJobFD = bgJobPoolFDs[0];
 	} catch (const std::exception &e) {
 		safs::log_err("masterconn_init_threads: Failed to create JobPool instance: {}", e.what());
@@ -345,8 +394,8 @@ int masterconn_init_threads(void) {
 		// serving only this master network thread, thus the number of listeners is 1.
 		std::vector<int> replicationJobPoolFDs(1);
 		gReplicationJobPool =
-		    std::make_shared<JobPool>("ma_repl", gReplicationNumberOfWorkers,
-		                              kMaxBackgroundJobsCount, 1, replicationJobPoolFDs);
+		    std::make_shared<MasterJobPool>("ma_repl", gReplicationNumberOfWorkers,
+		                                    kMaxBackgroundJobsCount, 1, replicationJobPoolFDs);
 		gReplicationJobFD = replicationJobPoolFDs[0];
 	} catch (const std::exception &e) {
 		safs::log_err("masterconn_init_threads: Failed to create ReplicationJobPool instance: {}",

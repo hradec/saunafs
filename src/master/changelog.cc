@@ -42,13 +42,13 @@
 
 #include "common/setup.h"
 #include "master/exceptions.h"
-#include "master/filesystem.h"
 #include "master/filesystem_metadata.h"
+#include "master/filesystem_operations_interface.h"
 #include "master/restore.h"
 #endif  // #if !defined(METARESTORE) && !defined(METALOGGER)
 
-Signal<ChangelogEvent> &getChangelogSignal() {
-	static Signal<ChangelogEvent> gChangelogSignal;
+Signal<const ChangelogEvent &> &getChangelogSignal() {
+	static Signal<const ChangelogEvent &> gChangelogSignal;
 	return gChangelogSignal;
 }
 
@@ -313,16 +313,14 @@ void load_changelogs() {
 				uint64_t first = changelogGetFirstLogVersion(s);
 				uint64_t last = changelogGetLastLogVersion(s);
 				if (last >= first) {
-					if (last >= fs_getversion()) {
-						load_changelog(s);
-					}
+					if (last >= gFSOperations->getMetadataVersion()) { load_changelog(s); }
 				} else {
 					throw InitializeException(
 					    "changelog " + fullFileName +
 					    " inconsistent, "
 					    "use sfsmetarestore to recover the filesystem; "
 					    "current fs version: " +
-					    std::to_string(fs_getversion()) +
+					    std::to_string(gFSOperations->getMetadataVersion()) +
 					    ", first change in the file: " + std::to_string(first));
 				}
 			} else if (oldExists && s != kChangelogFilename) {
@@ -348,7 +346,7 @@ void load_changelog(const std::string &path) {
 	uint64_t appliedEntries = 0;
 	while (std::getline(changelog, line).good()) {
 		id = std::stoull(line, &end);
-		if (id < fs_getversion()) {
+		if (id < gFSOperations->getMetadataVersion()) {
 			++skippedEntries;
 			continue;
 		} else if (!first) {

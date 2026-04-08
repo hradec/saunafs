@@ -19,23 +19,25 @@
 
 #pragma once
 
-#include "bgjobs.h"
 #include "common/platform.h"
 
 #include <cstdint>
 #include <list>
 #include <memory>
-#include <set>
 #include <vector>
 
 #include "chunkserver-common/disk_utils.h"
+#include "chunkserver/bgjobs.h"
 #include "chunkserver/io_buffers.h"
 #include "common/aligned_allocator.h"
 #include "common/chunk_part_type.h"
 #include "common/network_address.h"
 #include "common/slice_traits.h"
-#include "devtools/request_log.h"
 #include "protocol/cltocs.h"
+
+class GetBlocksHighLevelOp;
+class ReadHighLevelOp;
+class WriteHighLevelOp;
 
 using AlignedVectorForIO = std::vector<uint8_t, AlignedAllocator<uint8_t, disk::kIoBlockSize>>;
 
@@ -60,12 +62,8 @@ struct PacketStruct {
 	uint32_t bytesLeft = 0;
 	std::vector<uint8_t> packet;
 
-	std::shared_ptr<InputBuffer> inputBuffer;
-
 	std::shared_ptr<OutputBuffer> outputBuffer;
 };
-
-class MessageSerializer;
 
 /**
  * @brief Represents a single connection to a chunkserver.
@@ -100,8 +98,9 @@ struct ChunkserverEntry {
 		Connecting,  // connecting to other chunkserver to form a writing chain
 		WriteInit,   // sending packet forming a chain to the next chunkserver
 		WriteForward,  // ready for writing data; will be forwarded to other CSs
-		WriteFinish,   // write error, will be closed after sending error status
-		Close,         // close request, will change to CloseWait or Closed
+		IOFinish,   // closing a connection after finishing IO, but before sending the final status
+		            // to the client
+		Close,      // close request, will change to CloseWait or Closed
 		CloseWait,  // waits for a worker to finish a job, then will be Closed
 		Closed      // ready to be deleted
 	};
@@ -113,7 +112,7 @@ struct ChunkserverEntry {
 	static constexpr uint32_t kGenerateChartExpectedPacketSize =
 	    sizeof(uint32_t);
 
-	JobPool *workerJobPool;  // Job pool assigned to a given network worker thread
+	ClientJobPool *workerJobPool;  // Job pool assigned to a given network worker thread
 
 	ChunkserverEntry::State state = ChunkserverEntry::State::Idle;
 	ChunkserverEntry::Mode mode = ChunkserverEntry::Mode::Header;
@@ -131,73 +130,22 @@ struct ChunkserverEntry {
 	uint8_t fwdHeaderBuffer[PacketHeader::kSize]{};  ///< fwd packet header buff
 	/// Stores the data of the incoming packet for processing
 	PacketStruct inputPacket;
-	uint8_t *fwdStartPtr = nullptr; ///< used for forwarding inputpacket data
-	uint32_t fwdBytesLeft = 0; ///< used for forwarding inputpacket data
+	PacketStruct fwdOutputPacket; ///< used for forwarding inputpacket data
 	PacketStruct fwdInputPacket; ///< used for receiving status from fwdSocket
 	std::vector<uint8_t> fwdInitPacket; ///< used only for write initialization
 
 	/// List of output packets waiting to be sent to the clients
 	std::list<std::unique_ptr<PacketStruct>> outputPackets;
 
-	/* write */
-	uint32_t writeJobId = 0; ///< ID of the current write job being processed
-	uint32_t writeJobWriteId = 0; ///< Specific write operation from client
-	/// writeJobWriteId's which:
-	/// - have been completed by our worker, but need ack from the next
-	///   chunkserver from the chain.
-	/// - have been acked by the next chunkserver from the chain, but are still
-	///   being written by us.
-	std::set<uint32_t> partiallyCompletedWrites;
-	/// Pointer to the input buffer in use.
-	InputBuffer *inputBufferInUse = nullptr;
-	///< Number of blocks to write to the device in one write job.
-	uint16_t maxBlocksPerHddWriteJob;
+	/// Number of pending write jobs in total for the write high level operations of this entry.
+	/// Used to determine when to close the connection after a close request.
+	uint32_t pendingWriteJobs = 0;
+	uint64_t chunkId = 0;           ///< R+W
+	uint32_t chunkVersion = 0;      ///< R+W
+	ChunkPartType chunkType = slice_traits::standard::ChunkPartType();  // R
 
-	/* read */
-	uint16_t maxBlocksPerHddReadJob; ///< Number of blocks to read from the device in one read job.
-	uint16_t maxParallelHddReadJobs; ///< Maximum size of pendingReadDataPackets.
-
-	/// List of read data packets waiting for the HDD worker to finish, and then be sent.
-	std::list<std::unique_ptr<PacketStruct>> pendingReadDataPackets;
-	std::list<uint32_t> pendingReadJobIds; ///< Job IDs for pending read operations.
-	/// List of read data packets within a failing read operation, which are to be discarded.
-	std::list<std::unique_ptr<PacketStruct>> toDiscardReadDataPackets;
-	std::list<uint32_t> toDiscardReadJobIds; ///< Job IDs for read operations to discard.
-
-	/* get blocks */
-	uint32_t getBlocksJobId = 0; ///< Current job ID for retrieving chunk blocks
-	uint16_t getBlocksJobResult = 0; ///< Result of the get blocks job
-
-	/* PacketStruct is common for read and write but meaning is different !!! */
-	std::unique_ptr<PacketStruct> writePacket =
-	    std::make_unique<PacketStruct>();
-
-	uint16_t pendingDelayedJobs = 0; ///< Number of remaining delayed jobs running
-	uint8_t isChunkOpen = 0;
-	uint64_t chunkId = 0; // R+W
-	uint32_t chunkVersion = 0; // R+W
-	ChunkPartType chunkType = slice_traits::standard::ChunkPartType(); // R
-	uint32_t offset = 0; ///< R: Offset within the chunk for the operation.
-	uint32_t size = 0; ///< R: Size of the current operation.
-
-	/// Pointer to the concrete serializer singleton.
-	/// Serializers could be of type:
-	/// - LegacyMessageSerializer: for legacy messages
-	/// - SaunaFsMessageSerializer: for new messages
-	MessageSerializer* messageSerializer = nullptr; // R+W
-
-	LOG_AVG_TYPE readOperationTimer;
-
-	ChunkserverEntry(int socket, JobPool *workerJobPool, uint16_t maxBlocksPerHddReadJob,
-	                 uint16_t maxParallelHddReadJobs, uint16_t maxBlocksPerHddWriteJob)
-	    : workerJobPool(workerJobPool),
-	      sock(socket),
-	      maxBlocksPerHddWriteJob(maxBlocksPerHddWriteJob),
-	      maxBlocksPerHddReadJob(maxBlocksPerHddReadJob),
-	      maxParallelHddReadJobs(maxParallelHddReadJobs) {
-		inputPacket.bytesLeft = PacketHeader::kSize;
-		inputPacket.startPtr = headerBuffer;
-	}
+	ChunkserverEntry(int socket, ClientJobPool *workerJobPool, uint16_t maxBlocksPerHddReadJob,
+	                 uint16_t maxParallelHddReadJobs, uint16_t maxBlocksPerHddWriteJob);
 
 	// Disallow copying and moving to avoid misuse.
 	ChunkserverEntry(const ChunkserverEntry &) = delete;
@@ -208,20 +156,21 @@ struct ChunkserverEntry {
 	/// Destructor: closes the sockets.
 	~ChunkserverEntry();
 
+	/// Clears completed write high level operations and tries to send instant replies if possible.
+	void everyLoopUpdateWrite();
+
+	/// Returns whether the last header type was SAU_CLTOCS_WRITE_DATA.
+	inline bool isLastHeaderTypeWriteData();
+
 	/// Attaches a packet to the output packet list (taking ownership).
 	inline void attachPacket(std::unique_ptr<PacketStruct> &&packet);
 
-	/// Preserves the inputPacket buffer into writePacket (to avoid copying it).
-	/// Used for write operations, where the data comes from the network.
-	inline void preserveInputPacket();
+	/// Attaches an output buffer to the output packet list (taking ownership).
+	void attachBuffer(std::shared_ptr<OutputBuffer> &&buffer);
 
 	/// Creates an attached packet from the given vector.
 	/// The function takes ownership of the vector.
 	void createAttachedPacket(std::vector<uint8_t> &packet);
-
-	void prepareInputBufferForWrite(uint32_t type, bool isForward);
-
-	InputBuffer* getInputBufferForWrite(uint32_t type, bool isForward);
 
 	/// Creates an attached packet with the given type and operation size.
 	///
@@ -230,18 +179,51 @@ struct ChunkserverEntry {
 	/// @return Pointer to the created packet data.
 	uint8_t *createAttachedPacket(uint32_t type, uint32_t operationSize);
 
-	/// Creates a detached packet with an output buffer.
-	/// @see OutputBufferPool
-	static std::unique_ptr<PacketStruct> createDetachedPacketWithOutputBuffer(
-	    const std::vector<uint8_t> &packetPrefix, uint32_t numBlocks);
+	/// Processes read or write bytes from the socket.
+	/// @param bytesRW The number of bytes read or written.
+	/// @param packet The packet structure being processed.
+	/// @param shouldForwardError Indicates if the error should be forwarded.
+	/// @param callerName The name of the calling function for logging purposes.
+	/// @param isRead Indicates if the operation is a read (true) or write (false).
+	/// @return True if the operation was successful, false otherwise.
+	bool processRWBytes(int bytesRW, PacketStruct &packet, bool shouldForwardError,
+	                    const char *callerName, bool isRead);
+
+	/// Reads the packet header from the socket.
+	/// @param socket The socket to read from.
+	/// @param packet The packet structure to fill.
+	/// @param headerBuf The buffer to store the header.
+	/// @param targetMode The mode to set after reading the header.
+	/// @return True if the header was read successfully, false otherwise.
+	bool readHeader(int socket, PacketStruct &packet, uint8_t *headerBuf, Mode &targetMode);
+
+	/// Reads data from the socket into the packet structure.
+	/// @param socket The socket to read from.
+	/// @param packet The packet structure to fill.
+	/// @return True if the data was read successfully, false otherwise.
+	bool readData(int socket, PacketStruct &packet);
+
+	/// Writes the packet data to the socket.
+	/// @param socket The socket to write to.
+	/// @param packet The packet structure containing the data to write.
+	/// @return True if the data was written successfully, false otherwise.
+	bool writePacket(int socket, PacketStruct &packet);
+
+	/// Processes a packet based on its type and the current mode.
+	/// @param packet The packet structure to process.
+	/// @param headerBuf The buffer containing the packet header.
+	/// @param targetMode The mode to set after processing the packet.
+	/// @param fromForward Indicates if the packet is being processed from a forward operation.
+	void processPacket(PacketStruct &packet, uint8_t *headerBuf, Mode &targetMode,
+	                   bool fromForward);
 
 	/// Handles forwarding errors by setting the appropriate error status and
-	/// transitioning the connection state to `WriteFinish`.
+	/// transitioning the connection state to `IOFinish`.
 	///
 	/// This function is called when an error occurs during forwarding
 	/// operations, such as read or write errors on the forwarding socket. It
 	/// serializes an error status message and attaches it to the packet, then
-	/// sets the state to `WriteFinish` to indicate that the connection should
+	/// sets the state to `IOFinish` to indicate that the connection should
 	/// be closed after sending the error status.
 	void fwdError();
 
@@ -296,9 +278,6 @@ struct ChunkserverEntry {
 	/// is eventually established
 	void retryConnect();
 
-	/// Checks and processes the next packet in the input buffer.
-	void checkNextPacket();
-
 	/// Processes a received packet based on its type.
 	///
 	/// @param type The type of the packet.
@@ -319,64 +298,14 @@ struct ChunkserverEntry {
 	void readInit(const uint8_t *data, PacketHeader::Type type,
 	              PacketHeader::Length length);
 
-	/// Prepares a read data packet.
-	///
-	/// Creates the packet to be used in the read operation and assigns the OutputBuffer to it.
-	/// The packet is then provided with the headers of the blocks to be read.
-	///
-	/// @param readDataPrefix A buffer to store the read data prefix.
-	/// @param jobSize The size of the job.
-	/// @param jobOffset The offset of the job.
-	/// @return A unique pointer to the prepared packet.
-	std::unique_ptr<PacketStruct> prepareReadDataPacket(std::vector<uint8_t> &readDataPrefix,
-	                                                    uint32_t jobSize, uint32_t jobOffset);
-
-	/// Continues a previously started read operation.
-	///
-	/// Processes the remaining data to be read from the chunkserver. If all
-	/// data has been read, it sends a read status message and closes the chunk.
-	/// Otherwise, it prepares the next part of the read operation.
-	///
-	/// @param callMaxParallelHddReadJobs The maximum number of parallel HDD read for this call.
-	/// @see ChunkserverEntry::readInit
-	void readContinue(uint16_t callMaxParallelHddReadJobs);
-
 	/// Requests a data prefetch operation.
 	/// Prefetch in this context means reading data from the disk and storing it
 	/// in the page cache.
 	void prefetch(const uint8_t *data, PacketHeader::Type type,
 	              PacketHeader::Length length);
-	
-	/// Prepares the discard of the current ongoing read operations.
-	///
-	/// It disables the jobs, changes the callback and moves the jobs from pending
-	/// to discard lists.
-	void prepareDiscardReadJobs();
-
-	/// Callback for when a read operation finishes.
-	static void readFinishedCallback(uint8_t status, void *entry);
-	/// Callback for when a discarded read operation finishes.
-	static void readDiscardCallback(uint8_t status, void *entry);
-	/// Callback after delayed close operations.
-	static void delayedCloseCallback(uint8_t status, void *entry);
-	/// Callback after delayed discard operations.
-	static void delayedDiscardCallback(uint8_t status, void *entry);
-	/// Callback for when a write operation finishes.
-	static void writeFinishedCallback(uint8_t status, void *entry);
-	/// Callback for when a job_open associated to a write operation finishes.
-	static void openWriteFinishedCallback(uint8_t status, void *entry);
-	/// Callback for legacy chunk block retrieval completion.
-	static void sauGetChunkBlocksFinishedLegacyCallback(uint8_t status,
-	                                                    void *entry);
-	/// Callback for chunk block retrieval completion.
-	static void sauGetChunkBlocksFinishedCallback(uint8_t status, void *entry);
-	/// Callback for chunk block retrieval completion.
-	static void getChunkBlocksFinishedCallback(uint8_t status, void *entry);
 
 	/// Serializes and attaches a write status message to the output packets list.
-	void createAttachedWriteStatus(uint8_t status, uint32_t writeId);
-	/// Retrieves chunk blocks from the given information.
-	void getChunkBlocks(const uint8_t *data, uint32_t length);
+	void createAttachedWriteStatus(uint64_t targetChunkId, uint8_t status, uint32_t writeId);
 
 	/// Retrieves chunk blocks from the given information using the new way.
 	void sauGetChunkBlocks(const uint8_t *data, uint32_t length);
@@ -426,6 +355,15 @@ struct ChunkserverEntry {
 	/// Checks if it is a read operation and tries to finish it.
 	void outputCheckReadFinished();
 
+	/// Checks if the chunk is open for reading or writing.
+	bool isChunkOpen();
+
+	/// Force closes any open chunks without checking if the operations are finished.
+	void forceCloseOpenChunks();
+
+	/// Checks if it is ready to be closed, and if so set the state to Closed.
+	void checkAndApplyClosed();
+
 	/// Closes all active jobs and updates the state.
 	///
 	/// This function disables and changes the callback for any active read,
@@ -434,4 +372,20 @@ struct ChunkserverEntry {
 	///
 	/// Called from the `NetworkWorkerThread` when a connection is closed.
 	void closeJobs();
+
+private:
+	/// Retrieves the active write high level operation for the current entry.
+	/// @param callerName The name of the calling function for logging purposes.
+	/// @return Pointer to the active `WriteHighLevelOp`, or `nullptr` if there is no active write
+	/// operation.
+	WriteHighLevelOp *getActiveWriteHLO(const char *callerName);
+
+	/// Max blocks per HDD write job
+	uint16_t maxBlocksPerHddWriteJob_;
+	/// Write operation related data
+	std::list<std::unique_ptr<WriteHighLevelOp>> writeHLOs_;
+	/// Read operation related data
+	std::unique_ptr<ReadHighLevelOp> readHLO_;
+	/// Get blocks operation related data
+	std::unique_ptr<GetBlocksHighLevelOp> getBlocksHLO_;
 };

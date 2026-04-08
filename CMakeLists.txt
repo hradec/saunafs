@@ -38,7 +38,7 @@ option(ENABLE_EXIT_ON_USR1      "Enable handler for SIGUSR1 which calls exit()" 
 option(THROW_INSTEAD_OF_ABORT   "Throw std::exception instead of calling abort"          OFF)
 option(ENABLE_DEBUG_LOG         "Enable prefix based debug logs"                         OFF)
 option(ENABLE_URAFT             "Enable installation of uraft util"                      ON)
-option(ENABLE_VERBOSE_ASCIIDOC  "Enable verbose output of asciidoc"                      OFF)
+option(ENABLE_VERBOSE_ASCIIDOCTOR  "Enable verbose output of asciidoctor"                OFF)
 option(ENABLE_TCMALLOC          "Enable use of tcmalloc-minimal library"                 OFF)
 option(ENABLE_JEMALLOC          "Enable use of jemalloc library"                         OFF)
 option(ENABLE_POLONAISE         "Enable polonaise"                                       ON)
@@ -54,10 +54,10 @@ option(ENABLE_CCACHE            "Enable ccache during compilation"              
 option(ENABLE_NFS_ACL_SUPPORT   "Enable nfs-ganesha ACL support"                         ON)
 option(ENABLE_COMPILE_COMMANDS  "Enable generation of compile_commands.json"             ON)
 option(ENABLE_PROMETHEUS        "Enable prometheus metrics"                              ON)
+option(ASCIIDOCTOR_AUTO_SETUP   "Permit CMake to self-install asciidoctor gem when absent" ON)
 # Experimental
 option(ENABLE_INODE64           "Enable 64 bits for inode numbers and quantities"        OFF)
 option(ENABLE_FOUNDATIONDB      "Enable FoundationDB experimental support"               OFF)
-
 option(GENERATE_GIT_INFO "Generate git info from current repository (for version commands)" ON)
 
 # If enabled (default), the file compile_commands.json is generated in the build
@@ -74,7 +74,7 @@ if(ENABLE_CCACHE AND CCACHE_FOUND)
   message(STATUS "Using ccache")
 endif()
 
-set(DEFAULT_MIN_VERSION "5.1.1")
+set(DEFAULT_MIN_VERSION "5.8.0")
 
 include(GNUInstallDirs)
 
@@ -94,12 +94,14 @@ set(CHUNKSERVER_NAME            "saunafs-chunkserver")
 set(CLIENT_NAME                 "saunafs-client")
 set(METALOGGER_NAME             "saunafs-metalogger")
 set(MASTER_NAME                 "saunafs-master")
+set(SFSMDS_NAME                 "saunafs-mds")
 set(URAFT_NAME                  "saunafs-uraft")
 string(REGEX REPLACE "/$" "" USR_SHARE_DOC_NO_SLASH "${USR_SHARE_DOC}")
 set(CHUNKSERVER_EXAMPLES_SUBDIR "${USR_SHARE_DOC_NO_SLASH}/${CHUNKSERVER_NAME}/${EXAMPLES_SUBDIR}")
 set(CLIENT_EXAMPLES_SUBDIR      "${USR_SHARE_DOC_NO_SLASH}/${CLIENT_NAME}/${EXAMPLES_SUBDIR}")
 set(METALOGGER_EXAMPLES_SUBDIR  "${USR_SHARE_DOC_NO_SLASH}/${METALOGGER_NAME}/${EXAMPLES_SUBDIR}")
 set(SFSMASTER_EXAMPLES_SUBDIR   "${USR_SHARE_DOC_NO_SLASH}/${MASTER_NAME}/${EXAMPLES_SUBDIR}")
+set(SFSMDS_EXAMPLES_SUBDIR      "${USR_SHARE_DOC_NO_SLASH}/${SFSMDS_NAME}/${EXAMPLES_SUBDIR}")
 set(URAFT_EXAMPLES_SUBDIR       "${USR_SHARE_DOC_NO_SLASH}/${URAFT_NAME}/${EXAMPLES_SUBDIR}")
 
 # Aliases
@@ -119,6 +121,7 @@ set(DEFAULT_MOUNTED_SUBFOLDER    "/"                        CACHE STRING "Defaul
 set(DEFAULT_SFSMOUNT_CONFIG_PATH "${ETC_PATH}/sfsmount.cfg" CACHE STRING "Default full path to sfsmount configuration file")
 set(SAUNAFS_BLOCKS_IN_CHUNK     "1024"                     CACHE STRING "Number of blocks in one chunk")
 set(SAUNAFS_BLOCK_SIZE          "65536"                    CACHE STRING "Number of bytes in one block")
+set(ASCIIDOCTOR_VERSION         "2.0.23"                   CACHE STRING "Pinned asciidoctor gem version")
 
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 message(STATUS "CMAKE_INSTALL_PREFIX: ${CMAKE_INSTALL_PREFIX}")
@@ -134,7 +137,7 @@ message(STATUS "ENABLE_DOCS: ${ENABLE_DOCS}")
 message(STATUS "ENABLE_EXIT_ON_USR1: ${ENABLE_EXIT_ON_USR1}")
 message(STATUS "THROW_INSTEAD_OF_ABORT: ${THROW_INSTEAD_OF_ABORT}")
 message(STATUS "ENABLE_DEBUG_LOG: ${ENABLE_DEBUG_LOG}")
-message(STATUS "ENABLE_VERBOSE_ASCIIDOC: ${ENABLE_VERBOSE_ASCIIDOC}")
+message(STATUS "ENABLE_VERBOSE_ASCIIDOCTOR: ${ENABLE_VERBOSE_ASCIIDOCTOR}")
 message(STATUS "ENABLE_TCMALLOC: ${ENABLE_TCMALLOC}")
 message(STATUS "ENABLE_JEMALLOC: ${ENABLE_JEMALLOC}")
 message(STATUS "ENABLE_POLONAISE: ${ENABLE_POLONAISE}")
@@ -207,7 +210,7 @@ endif()
 string(TIMESTAMP BUILD_TIMESTAMP)
 add_compile_definitions(BUILD_TIME="${BUILD_TIMESTAMP}")
 
-if(VERSION_SUFFIX)
+if(DEFINED VERSION_SUFFIX)
   set(PACKAGE_VERSION "${DEFAULT_MIN_VERSION}${VERSION_SUFFIX}")
 else()
   set(PACKAGE_VERSION "${DEFAULT_MIN_VERSION}-dev")
@@ -385,7 +388,7 @@ set(MAIN_SRC ${CMAKE_SOURCE_DIR}/src/main/main.cc)
 if(ZLIB_FOUND)
   include_directories(${ZLIB_INCLUDE_DIRS})
 endif()
-include_directories(src) # Allow paths relative to src, eg. #include common/crc.h
+include_directories(${CMAKE_SOURCE_DIR}/src) # Allow paths relative to src, eg. #include common/crc.h
 link_directories(${LINK_DIRECTORIES} ${FUSE_LIBRARY_DIR})
 
 set(ICON_RESOURCE_FILE "")
@@ -426,6 +429,10 @@ if(NOT MINGW)
     add_subdirectory(src/fdb)
   endif()
   add_subdirectory(src/master)
+  if(ENABLE_FOUNDATIONDB AND EXISTS ${CMAKE_SOURCE_DIR}/src/mds)
+    ## mds does not make sense so far without fdb
+    add_subdirectory(src/mds)
+  endif()
   add_subdirectory(src/metadump)
   add_subdirectory(src/metalogger)
   add_subdirectory(src/metarestore)

@@ -27,6 +27,7 @@
 #include <sys/time.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -75,8 +76,11 @@
 #define CHARTS_CHUNKIOJOBS 28
 #define CHARTS_CHUNKOPJOBS 29
 #define CHARTS_MEMORY 30
+#define CHARTS_GC_PURGE 31
+#define CHARTS_SPACE_GROWTH 32
+#define CHARTS_SPACE_RECLAIMED 33
 
-#define CHARTS_NUMBER 31
+#define CHARTS_NUMBER 34
 
 const unsigned long kLinuxMaxrssSize = 1024UL;
 
@@ -113,6 +117,9 @@ const unsigned long kLinuxMaxrssSize = 1024UL;
 	{"chunkiojobs"      ,CHARTS_MODE_MAX,0,CHARTS_SCALE_NONE ,   1, 1}, \
 	{"chunkopjobs"      ,CHARTS_MODE_MAX,0,CHARTS_SCALE_NONE ,   1, 1}, \
 	{"memory"           ,CHARTS_MODE_MAX,0,CHARTS_SCALE_NONE ,   1, 1}, \
+	{"gcpurge"          ,CHARTS_MODE_ADD,0,CHARTS_SCALE_NONE ,   1, 1}, \
+	{"spacegrowth"      ,CHARTS_MODE_ADD,0,CHARTS_SCALE_NONE ,   1,60}, \
+	{"spacereclaimed"   ,CHARTS_MODE_ADD,0,CHARTS_SCALE_NONE ,   1,60}, \
 	{NULL               ,0              ,0,0                 ,   0, 0}  \
 };
 
@@ -138,13 +145,6 @@ static const statdef statdefs[]=STATDEFS
 static const estatdef estatdefs[]=ESTATDEFS
 
 static struct itimerval it_set;
-
-// Signal handler that prevents process termination from timer signals
-static void timerSignalHandler(int /*signal*/) {
-	// Reset both timers to prevent future signals from killing the process
-	setitimer(ITIMER_PROF, &it_set, nullptr);
-	setitimer(ITIMER_VIRTUAL, &it_set, nullptr);
-}
 
 inline uint32_t toMicroSeconds(struct itimerval &itimer) {
     return itimer.it_value.tv_sec * 1000000 + itimer.it_value.tv_usec;
@@ -172,8 +172,9 @@ void chartsdata_refresh(void) {
 	uint64_t bytesIn, bytesOut, totalBytesRead, totalBytesWrite;
 	uint32_t opsRead, opsWrite, totalOpsRead, totalOpsWrite, replications = 0;
 	uint32_t opsCreate, opsDelete, opsUpdateVersion, opsDuplicate, opsTruncate;
-	uint32_t opsDupTrunc, opsTest;
+	uint32_t opsDupTrunc, opsTest, opsGCPurge;
 	uint32_t maxChunkServerJobsCount, maxMasterJobsCount;
+	int64_t usedSpaceDelta;
 
 	// Timer runs only when the process is executing.
 	struct itimerval userTime;
@@ -252,9 +253,8 @@ void chartsdata_refresh(void) {
 	data[CHARTS_TOTAL_LLOPW] = totalOpsWrite;
 	data[CHARTS_REPL] = replications + gReplicator.getStats();
 
-	HddStats::operationStats(&opsCreate, &opsDelete, &opsUpdateVersion,
-	                         &opsDuplicate, &opsTruncate, &opsDupTrunc,
-	                         &opsTest);
+	HddStats::operationStats(&opsCreate, &opsDelete, &opsUpdateVersion, &opsDuplicate, &opsTruncate,
+	                         &opsDupTrunc, &opsTest, &opsGCPurge);
 	data[CHARTS_CREATE] = opsCreate;
 	data[CHARTS_DELETE] = opsDelete;
 	data[CHARTS_VERSION] = opsUpdateVersion;
@@ -262,6 +262,12 @@ void chartsdata_refresh(void) {
 	data[CHARTS_TRUNCATE] = opsTruncate;
 	data[CHARTS_DUPTRUNC] = opsDupTrunc;
 	data[CHARTS_TEST] = opsTest;
+	data[CHARTS_GC_PURGE] = opsGCPurge;
+
+	HddStats::getSpaceDeltaStats(&usedSpaceDelta);
+
+	data[CHARTS_SPACE_GROWTH] = std::max(usedSpaceDelta, int64_t(0));
+	data[CHARTS_SPACE_RECLAIMED] = std::max(-usedSpaceDelta, int64_t(0));
 
 	charts_add(data, eventloop_time() - SECONDS_IN_ONE_MINUTE);
 }
@@ -276,7 +282,7 @@ void chartsdata_store(void) {
 	charts_store();
 }
 
-int chartsdata_init(void) {
+int chartsdata_init() {
 	struct itimerval userTime, procTime;
 
 	it_set.it_interval.tv_sec = 0;
@@ -284,19 +290,11 @@ int chartsdata_init(void) {
 	it_set.it_value.tv_sec = 999;
 	it_set.it_value.tv_usec = 999999;
 
-	// Install timer signal handlers for SIGVTALRM and SIGPROF
-	if (initializeTimerSignalHandlers(timerSignalHandler) != 0) {
-		safs::log_err("{} failed to initialize timer signal handlers", __func__);
-		return -1;
-	}
-
 	setitimer(ITIMER_VIRTUAL, &it_set, &userTime); // user time
 	setitimer(ITIMER_PROF, &it_set, &procTime);    // user time + system time
 
-	eventloop_timeregister(TIMEMODE_RUN_LATE, SECONDS_IN_ONE_MINUTE, 0,
-	                       chartsdata_refresh);
-	eventloop_timeregister(TIMEMODE_RUN_LATE, SECONDS_IN_ONE_HOUR, 0,
-	                       chartsdata_store);
+	eventloop_timeregister(TIMEMODE_RUN_LATE, SECONDS_IN_ONE_MINUTE, 0, chartsdata_refresh);
+	eventloop_timeregister(TIMEMODE_RUN_LATE, SECONDS_IN_ONE_HOUR, 0, chartsdata_store);
 	eventloop_destructregister(chartsdata_term);
 	return charts_init(calcdefs, statdefs, estatdefs, CHARTS_FILENAME);
 }

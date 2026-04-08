@@ -22,185 +22,340 @@
 
 #include "common/platform.h"
 
-#include "master/filesystem_metadata.h"
+#include <initializer_list>
+#include <optional>
+
+#include "master/filesystem_node_operations_interface.h"
 #include "master/filesystem_node_types.h"
 #include "master/fs_context.h"
 #include "protocol/directory_entry.h"
+#include "protocol/handle_inode_entry.h"
 #include "protocol/named_inode_entry.h"
+#include "protocol/quota.h"
 
-namespace detail {
+/// Base class for filesystem node operations extensibility.
+///
+/// Provides default implementations for all methods of IFilesystemNodeOperations interface,
+/// assuming an in-memory metadata representation.
+class FilesystemNodeOperationsBase : public IFilesystemNodeOperations {
+public:
+	/// Returns the root node of the filesystem.
+	FSNodeDirectory *getRootNode(const FilesystemOperationContext &fsOpContext) override;
 
-inline FSNode *fsnodes_id_to_node_internal(inode_t id) {
-	// Find the node with the given id
-	uint32_t nodeHashIndex = NODEHASHPOS(id);
+	/// Looks up a child node by name within a directory.
+	/// @see IFilesystemNodeOperations::lookup
+	FSNode *lookup([[maybe_unused]] const FilesystemOperationContext &fsOpContext,
+	               FSNodeDirectory *node, const HString &name,
+	               bool isCaseInsensitive = false) const override;
 
-	for (const auto &node : gMetadata->nodeHash[nodeHashIndex]) {
-		if (node->id == id) {
-			return node;
-		}
-	}
+	FSNode *createNode(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	                   FSNodeDirectory *parent, const HString &name, FSNodeType type, uint16_t mode,
+	                   uint16_t umask, uint32_t uid, uint32_t gid, uint8_t copysgid,
+	                   AclInheritance inheritAcl, inode_t requestedINode = 0) override;
 
-	return nullptr;
-}
+	/// Syncs the current state of the node to persistent storage on backends that need it.
+	/// @see IFilesystemNodeOperations::updateNode
+	/// @note This implementation is a no-op for in-memory storage.
+	void updateNode([[maybe_unused]] const FilesystemOperationContext &fsOpContext,
+	                [[maybe_unused]] FSNode *node) override;
 
-template<class NodeType>
-inline void fsnodes_check_node_type(const NodeType *node) {
-	assert(node);
-	(void)node;
-}
+	void link(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	          FSNodeDirectory *parent, FSNode *child, const HString &name) override;
 
-template<>
-inline void fsnodes_check_node_type(const FSNodeFile *node) {
-	assert(node && (node->type == FSNodeType::kFile || node->type == FSNodeType::kTrash ||
-	                node->type == FSNodeType::kReserved));
-	(void)node;
-}
+	/// Unlink the child node from the parent directory.
+	/// @see IFilesystemNodeOperations::unlink
+	void unlink(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	            FSNodeDirectory *parent, const HString &childName, FSNode *childNode) override;
 
-template<>
-inline void fsnodes_check_node_type(const FSNodeDirectory *node) {
-	assert(node && node->type == FSNodeType::kDirectory);
-	(void)node;
-}
+	/// Remove the edge between parent and child nodes.
+	/// @see IFilesystemNodeOperations::removeEdge
+	void removeEdge(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	                FSNodeDirectory *parent, const HString &childName, FSNode *childNode) override;
 
-template<>
-inline void fsnodes_check_node_type(const FSNodeSymlink *node) {
-	assert(node && node->type == FSNodeType::kSymlink);
-	(void)node;
-}
+	void updateCTime(FSNode *node, uint32_t ctime) override;
 
-template<>
-inline void fsnodes_check_node_type(const FSNodeDevice *node) {
-	assert(node && (node->type == FSNodeType::kBlockDev || node->type == FSNodeType::kCharDev));
-	(void)node;
-}
+	void fillAttr(const FilesystemOperationContext &fsOpContext, FSNode *node, FSNode *parent,
+	              uint32_t uid, uint32_t gid, uint32_t auid, uint32_t agid, uint8_t sesflags,
+	              Attributes &attr) override;
+	void fillAttr(const FsContext &context, const FilesystemOperationContext &fsOpContext,
+	              FSNode *node, FSNode *parent, Attributes &attr) override;
 
-} // detail
+	/// Retrieves statistics for a filesystem node.
+	/// @see IFilesystemNodeOperations::getStats
+	void getStats([[maybe_unused]] const FilesystemOperationContext &fsOpContext, FSNode *node,
+	              StatsRecord *statsOut) override;
 
-/// searches for an edge with given name (`name`) in given directory (`node`)
-inline FSNode *fsnodes_lookup(FSNodeDirectory *node, const HString &name) {
-	auto it = node->find(name);
-	if (it != node->end()) {
-		return (*it).second;
-	}
+	/// Adds statistics to a directory and recursively propagates to all ancestors.
+	/// @see IFilesystemNodeOperations::addStats
+	void addStats(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *parent,
+	              StatsRecord *stats) override;
 
-	return nullptr;
-}
+	/// Subtracts statistics from a directory and recursively propagates to all ancestors.
+	/// @see IFilesystemNodeOperations::subStats
+	void subStats(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *parent,
+	              StatsRecord *stats) override;
 
-template<class NodeType>
-inline NodeType *fsnodes_id_to_node_verify(inode_t id) {
-	auto *node = static_cast<NodeType *>(detail::fsnodes_id_to_node_internal(id));
-	detail::fsnodes_check_node_type(node);
-	return node;
-}
+	/// Updates directory statistics by propagating the delta between old and new stats.
+	/// @see IFilesystemNodeOperations::addSubStats
+	void addSubStats(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *parent,
+	                 StatsRecord *newStats, StatsRecord *previousStats) override;
 
-template<class NodeType = FSNode>
-inline NodeType *fsnodes_id_to_node(inode_t id) {
-	return static_cast<NodeType*>(detail::fsnodes_id_to_node_internal(id));
-}
+	/// Updates all parent directories' statistics based on a node's stats change.
+	/// @see IFilesystemNodeOperations::updateParentStatsForNode
+	void updateParentStatsForNode(const FilesystemOperationContext &fsOpContext, FSNode *node,
+	                              StatsRecord *newStats, StatsRecord *previousStats) override;
 
-inline void fsnodes_update_ctime(FSNode *node, uint32_t ctime) {
-	if (node->type == FSNodeType::kTrash && node->ctime != ctime) {
-		auto old_key = TrashPathKey(node);
-		node->ctime = ctime;
-		auto it = gMetadata->trash.find(old_key);
-		if (it != gMetadata->trash.end()) {
-			hstorage::Handle path = std::move((*it).second);
-			gMetadata->trash.erase(it);
-			gMetadata->trash.insert({TrashPathKey(node), std::move(path)});
-		}
-	} else {
-		node->ctime = ctime;
-	}
-}
+	void changeUidGid(const FilesystemOperationContext &fsOpContext, FSNode *node, uint32_t uid,
+	                  uint32_t gid) override;
 
-std::string fsnodes_escape_name(const std::string &name);
-int fsnodes_purge(uint32_t ts, FSNode *p);
-uint32_t fsnodes_getdetachedsize(const TrashPathContainer &data);
-void fsnodes_getdetacheddata(const TrashPathContainer &data, uint8_t *dbuff);
-void fsnodes_getdetacheddata(const TrashPathContainer &data, uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries);
-uint32_t fsnodes_getdetachedsize(const ReservedPathContainer &data);
-void fsnodes_getdetacheddata(const ReservedPathContainer &data, uint8_t *dbuff);
-void fsnodes_getdetacheddata(const ReservedPathContainer &data, uint32_t off, uint32_t max_entries, std::vector<NamedInodeEntry> &entries);
-void fsnodes_getpath(FSNodeDirectory *parent, FSNode *child, std::string &path);
-void fsnodes_fill_attr(FSNode *node, FSNode *parent, uint32_t uid, uint32_t gid, uint32_t auid,
-	uint32_t agid, uint8_t sesflags, Attributes &attr);
-void fsnodes_fill_attr(const FsContext &context, FSNode *node, FSNode *parent, Attributes &attr);
+	void setLength(const FilesystemOperationContext &fsOpContext, FSNodeFile *nodeFile,
+	               uint64_t length, bool eraseFurtherChunks) override;
+	uint8_t appendChunks(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	                     FSNodeFile *destNodeFile, FSNodeFile *srcNodeFile) override;
+	void changeFileGoal(const FilesystemOperationContext &fsOpContext, FSNodeFile *nodeFile,
+	                    uint8_t goal) override;
+#ifndef METARESTORE
+	void checkFile(FSNodeFile *nodeFile, ChunkCountArray &chunkCount) override;
+#endif
+	int64_t getSize(const FilesystemOperationContext &fsOpContext, FSNode *node) override;
 
-uint8_t verify_session(const FsContext &context, OperationMode operationMode,
-	SessionType sessionType);
+	/// Returns the number of parents of the given node.
+	/// @see IFilesystemNodeOperations::getNumberOfParents
+	/// @note fsOpContext is unused in this in-memory implementation.
+	uint64_t getNumberOfParents(const FilesystemOperationContext &fsOpContext,
+	                            const FSNode *node) override;
 
-uint8_t fsnodes_get_node_for_operation(const FsContext &context, ExpectedNodeType expectedNodeType,
-                                       uint8_t modemask, inode_t inode, FSNode **ret,
-                                       FSNodeDirectory **ret_rn = nullptr);
-uint8_t fsnodes_undel(uint32_t ts, FSNodeFile *node);
+#ifndef METARESTORE
+	uint32_t getDirSize(const FSNodeDirectory *nodeDir, uint8_t withAttr) override;
+	void getDirData(const FilesystemOperationContext &fsOpContext, inode_t rootINode, uint32_t uid,
+	                uint32_t gid, uint32_t auid, uint32_t agid, uint8_t sesflags,
+	                FSNodeDirectory *nodeDir, uint8_t *outBuffer, uint8_t withAttr) override;
 
-int fsnodes_namecheck(const std::string &name);
-void fsnodes_get_stats(FSNode *node, StatsRecord *sr);
-bool fsnodes_isancestor_or_node_reserved_or_trash(FSNodeDirectory *f, FSNode *p);
-int fsnodes_access(const FsContext &context, FSNode *node, uint8_t modemask);
+	/// Returns the number of entries in the given directory.
+	/// @see IFilesystemNodeOperations::getNumberOfDirEntries
+	/// @note fsOpContext is unused in this in-memory implementation.
+	uint64_t getNumberOfDirEntries(const FilesystemOperationContext &fsOpContext,
+	                               const FSNodeDirectory *nodeDir) override;
 
-void fsnodes_setlength(FSNodeFile *obj, uint64_t length, bool eraseFurtherChunks);
-void fsnodes_change_uid_gid(FSNode *p, uint32_t uid, uint32_t gid);
-int fsnodes_nameisused(FSNodeDirectory *node, const HString &name);
-bool fsnodes_inode_quota_exceeded(uint32_t uid, uint32_t gid);
+	/// Get entries of directory node \a nodeDir.
+	/// @see IFilesystemNodeOperations::getDir
+	void getDir(const FilesystemOperationContext &fsOpContext, inode_t rootINode, uint32_t uid,
+	            uint32_t gid, uint32_t auid, uint32_t agid, uint8_t sesflags,
+	            FSNodeDirectory *nodeDir, uint64_t firstEntry, uint64_t numberOfEntries,
+	            std::vector<DirectoryEntry> &dirEntriesOut) override;
+#endif
 
-FSNode *fsnodes_create_node(uint32_t ts, FSNodeDirectory *node, const HString &name,
-                            FSNodeType type, uint16_t mode, uint16_t umask, uint32_t uid,
-                            uint32_t gid, uint8_t copysgid, AclInheritance inheritacl,
-                            inode_t req_inode = 0);
+	/// Returns direct child inode IDs for a directory.
+	/// @see IFilesystemNodeOperations::getDirectoryChildInodes
+	std::vector<inode_t> getDirectoryChildInodes(const FilesystemOperationContext &fsOpContext,
+	                                             const FSNodeDirectory *nodeDir) override;
 
-void fsnodes_add_stats(FSNodeDirectory *parent, StatsRecord *sr);
-int fsnodes_sticky_access(FSNode *parent, FSNode *node, uint32_t uid);
-void fsnodes_unlink(uint32_t ts, FSNodeDirectory *parent, const HString &node_name, FSNode *node);
-bool fsnodes_isancestor(FSNodeDirectory *f, FSNode *p);
-void fsnodes_remove_edge(uint32_t ts, FSNodeDirectory *parent, const HString &node_name, FSNode *node);
-void fsnodes_link(uint32_t ts, FSNodeDirectory *parent, FSNode *child, const HString &name);
+	/// Checks if a name is already used in the given directory.
+	/// @see IFilesystemNodeOperations::isNameUsed
+	bool isNameUsed(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *node,
+	                const HString &name, bool isCaseInsensitive = false) override;
 
-uint8_t fsnodes_appendchunks(uint32_t ts, FSNodeFile *dstobj, FSNodeFile *srcobj);
-void fsnodes_changefilegoal(FSNodeFile *obj, uint8_t goal);
-uint32_t fsnodes_getdirsize(const FSNodeDirectory *p, uint8_t withattr);
-void fsnodes_getdirdata(inode_t rootinode, uint32_t uid, uint32_t gid, uint32_t auid, uint32_t agid,
-                        uint8_t sesflags, FSNodeDirectory *p, uint8_t *dbuff, uint8_t withattr);
-namespace legacy {
-/**
- * This implementation was not removed so as to support pre-3.13 client (sfsmount) using
- * old SAU_FUSE_GETDIR packet version (0 = kLegacyClient).
- */
-void fsnodes_getdir(inode_t rootinode, uint32_t uid, uint32_t gid, uint32_t auid, uint32_t agid,
-                    uint8_t sesflags, FSNodeDirectory *p, uint64_t first_entry,
-                    uint64_t number_of_entries, std::vector<legacy::DirectoryEntry> &dir_entries);
-} // namespace legacy
-void fsnodes_getdir(inode_t rootinode, uint32_t uid, uint32_t gid, uint32_t auid, uint32_t agid,
-                    uint8_t sesflags, FSNodeDirectory *p, uint64_t first_entry,
-                    uint64_t number_of_entries, std::vector<DirectoryEntry> &dir_entries);
-void fsnodes_checkfile(FSNodeFile *p, uint32_t chunkcount[CHUNK_MATRIX_SIZE]);
+	// Trash/Reserved operations
+	int purge(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	          FSNode *node) override;
+	uint8_t undel(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	              FSNodeFile *node) override;
+#ifndef METARESTORE
+	uint32_t getDetachedSize(const TrashPathContainer &data) override;
+	void getDetachedData(const TrashPathContainer &data, uint8_t *outBuffer) override;
+	void getDetachedData(const TrashPathContainer &data, uint32_t offset, uint32_t maxEntries,
+	                     std::vector<NamedInodeEntry> &entries) override;
+	uint32_t getDetachedSize(const ReservedPathContainer &data) override;
+	void getDetachedData(const ReservedPathContainer &data, uint8_t *outBuffer) override;
+	void getDetachedData(const ReservedPathContainer &data, uint32_t offset, uint32_t maxEntries,
+	                     std::vector<NamedInodeEntry> &entries) override;
 
-bool fsnodes_has_tape_goal(FSNode *node);
-void fsnodes_add_sub_stats(FSNodeDirectory *parent, StatsRecord *newsr, StatsRecord *prevsr);
+	/// Returns entries from a HandleIndexContainer starting at a given handleOffset.
+	/// @see IFilesystemNodeOperations::getDetachedData
+	void getDetachedData(const FilesystemOperationContext &fsOpContext,
+	                     const HandleIndexContainer &data, uint64_t handleOffset,
+	                     uint32_t maxEntries, std::vector<HandleInodeEntry> &entries,
+	                     bool fromTrash) override;
+#endif
 
-void fsnodes_getgoal_recursive(FSNode *node, uint8_t gmode, GoalStatistics &fgtab,
-                               GoalStatistics &dgtab);
+	// Path operations
+	void getPath(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *parent,
+	             FSNode *child, std::string &path) override;
+	uint32_t getPathSize(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *parent,
+	                     FSNode *child) override;
+	void getPathData(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *parent,
+	                 FSNode *child, uint8_t *path, uint32_t size) override;
+	std::string escapeName(const std::string &name) override;
 
-void fsnodes_gettrashtime_recursive(FSNode *node, uint8_t gmode, TrashtimeMap &fileTrashtimes,
-                                    TrashtimeMap &dirTrashtimes);
-void fsnodes_geteattr_recursive(FSNode *node, uint8_t gmode, uint32_t feattrtab[16],
-                                uint32_t deattrtab[16]);
-void fsnodes_setgoal_recursive(FSNode *node, uint32_t ts, uint32_t uid, uint8_t goal, uint8_t smode,
-                               inode_t *sinodes, inode_t *ncinodes, inode_t *nsinodes);
-void fsnodes_settrashtime_recursive(FSNode *node, uint32_t ts, uint32_t uid, uint32_t trashtime,
-                                    uint8_t smode, inode_t *sinodes, inode_t *ncinodes,
-                                    inode_t *nsinodes);
-void fsnodes_seteattr_recursive(FSNode *node, uint32_t ts, uint32_t uid, uint8_t eattr,
-                                uint8_t smode, inode_t *sinodes, inode_t *ncinodes,
-                                inode_t *nsinodes);
-uint8_t fsnodes_deleteacl(FSNode *p, AclType type, uint32_t ts);
+	// ACL operations
 
-uint8_t fsnodes_setacl(FSNode *p, const RichACL &acl, uint32_t ts);
-uint8_t fsnodes_setacl(FSNode *p, AclType type, const AccessControlList &acl, uint32_t ts);
-uint8_t fsnodes_getacl(FSNode *p, RichACL &acl);
+	/// Stores a RichACL on a node, replacing any previously stored ACL.
+	/// @see IFilesystemNodeOperations::setAcl
+	uint8_t setAcl(const FilesystemOperationContext &fsOpContext, FSNode *node, const RichACL &acl,
+	               uint32_t timeStamp) override;
 
-uint32_t fsnodes_getpath_size(FSNodeDirectory *parent, FSNode *child);
-void fsnodes_getpath_data(FSNodeDirectory *parent, FSNode *child, uint8_t *path, uint32_t size);
+	/// Merges a POSIX ACL into the node's stored RichACL.
+	/// @see IFilesystemNodeOperations::setAcl
+	uint8_t setAcl(const FilesystemOperationContext &fsOpContext, FSNode *node, AclType type,
+	               const AccessControlList &acl, uint32_t timeStamp) override;
 
-int64_t fsnodes_get_size(FSNode *node);
-FSNodeDirectory *fsnodes_get_first_parent(FSNode *node);
+#ifndef METARESTORE
+	/// Retrieves the stored RichACL for a node.
+	/// @see IFilesystemNodeOperations::getAcl
+	uint8_t getAcl(const FilesystemOperationContext &fsOpContext, FSNode *node,
+	               RichACL &acl) override;
+#endif  // METARESTORE
+
+	/// Removes or prunes the ACL stored on a node according to the ACL type.
+	/// @see IFilesystemNodeOperations::deleteAcl
+	uint8_t deleteAcl(const FilesystemOperationContext &fsOpContext, FSNode *node, AclType type,
+	                  uint32_t timeStamp) override;
+
+	// Recursive operations
+#ifndef METARESTORE
+	void getGoalRecursive(const FilesystemOperationContext &fsOpContext, FSNode *node,
+	                      uint8_t gmode, GoalStatistics &fileGoalsTab,
+	                      GoalStatistics &dirGoalsTab) override;
+	void getTrashTimeRecursive(FSNode *node, uint8_t gmode, TrashtimeMap &fileTrashtimes,
+	                           TrashtimeMap &dirTrashtimes) override;
+
+	/// Aggregates extra-attribute histogram counters for a node or subtree.
+	/// @see IFilesystemNodeOperations::getExtraAttrRecursive
+	void getExtraAttrRecursive(FSNode *node, uint8_t gmode, ExtraAttributesArray &fileEAttrTab,
+	                           ExtraAttributesArray &dirEAttrTab) override;
+#endif  // METARESTORE
+	void setgoalRecursive(const FilesystemOperationContext &fsOpContext, FSNode *node,
+	                      uint32_t timeStamp, uint32_t uid, uint8_t goal, uint8_t smode,
+	                      inode_t *modifiedINodesOut, inode_t *unchangedINodesOut,
+	                      inode_t *permissionDeniedINodesOut) override;
+
+	void setTrashTimeRecursive(FSNode *node, uint32_t timeStamp, uint32_t uid, uint32_t trashtime,
+	                           uint8_t smode, inode_t *modifiedINodesOut,
+	                           inode_t *unchangedINodesOut,
+	                           inode_t *permissionDeniedINodesOut) override;
+
+	/// Applies extra-attribute updates on a node or subtree and tracks outcomes.
+	/// @see IFilesystemNodeOperations::setExtraAttrRecursive
+	void setExtraAttrRecursive(const FilesystemOperationContext &fsOpContext, FSNode *node,
+	                           uint32_t timeStamp, uint32_t uid, uint8_t eattr, uint8_t smode,
+	                           inode_t *modifiedINodesOut, inode_t *unchangedINodesOut,
+	                           inode_t *permissionDeniedINodesOut) override;
+
+	// Access control operations
+	int access(const FsContext &context, const FilesystemOperationContext &fsOpContext,
+	           FSNode *node, uint8_t modeMask) override;
+
+protected:
+	/// Returns the stored RichACL for @p node, or nullptr if none is present.
+	/// @p scratch is an optional caller-supplied buffer; implementations that need
+	/// to materialise a temporary ACL (e.g. KV backends) emplace into @p scratch
+	/// and return &scratch->value(), while the default in-memory implementation
+	/// leaves @p scratch empty and returns a pointer into aclStorage directly.
+	/// The caller avoids constructing a RichACL when it is not needed.
+	virtual const RichACL *getAclForAccess(const FilesystemOperationContext &fsOpContext,
+	                                       FSNode *node, std::optional<RichACL> &scratch);
+	int stickyAccess(FSNode *parent, FSNode *node, uint32_t uid) override;
+	int nameCheck(const std::string &name) override;
+	uint8_t verifySession(const FsContext &context, OperationMode operationMode,
+	                      SessionType sessionType) override;
+
+	/// Treating rootinode as the root of the hierarchy, converts (rootinode, inode) to FSNode*.
+	/// @see IFilesystemNodeOperations::getNodeForOperation
+	uint8_t getNodeForOperation(const FsContext &context,
+	                            const FilesystemOperationContext &fsOpContext,
+	                            ExpectedNodeType expectedNodeType, uint8_t modeMask, inode_t inode,
+	                            FSNode **nodeOut, FSNodeDirectory **rootDirOut = nullptr) override;
+
+	// Ancestry operations
+
+	/// Returns true if \a ancestor is ancestor of \a node.
+	/// @see IFilesystemNodeOperations::isAncestor
+	bool isAncestor(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *ancestor,
+	                FSNode *node) override;
+
+	/// Returns true if \a node is reserved or in trash or \a ancestor is ancestor of \a node.
+	/// @see IFilesystemNodeOperations::isAncestorOrNodeReservedOrTrash
+	bool isAncestorOrNodeReservedOrTrash(const FilesystemOperationContext &fsOpContext,
+	                                     FSNodeDirectory *ancestor, FSNode *node) override;
+
+	FSNodeDirectory *getFirstParent(const FilesystemOperationContext &fsOpContext,
+	                                FSNode *node) override;
+
+	/// @see IFilesystemNodeOperations::getFirstParentId
+	inode_t getFirstParentId([[maybe_unused]] const FilesystemOperationContext &fsOpContext,
+	                         FSNode *node) override;
+
+	/// Returns the IDs of all parents of the given node.
+	/// @see IFilesystemNodeOperations::getParentIds
+	std::vector<inode_t> getParentIds(
+	    [[maybe_unused]] const FilesystemOperationContext &fsOpContext, FSNode *node) override;
+
+	/// Returns the edge name that links parentId -> node.
+	/// @see IFilesystemNodeOperations::getChildNameByParentId
+	std::string getChildNameByParentId(const FilesystemOperationContext &fsOpContext,
+	                                   inode_t parentId, const FSNode *node) override;
+
+	/// Internal node lookup operation with context - override in subclasses for custom storage.
+	/// @see IFilesystemNodeOperations::idToNodeInternal
+	FSNode *idToNodeInternal(const FilesystemOperationContext &fsOpContext,
+	                         inode_t inode) const override;
+
+	/// Increases the node counters for the specified type.
+	/// @see IFilesystemNodeOperations::incrementNodeCounters
+	void incrementNodeCounters(const FilesystemOperationContext &fsOpContext,
+	                           FSNodeType type) override;
+
+	/// Preserves the given node in the underlying storage (in-memory in this implementation).
+	/// @see IFilesystemNodeOperations::preserveNode
+	void preserveNode(const FilesystemOperationContext &fsOpContext, FSNode *node) override;
+
+	/// Preserves the edge between parent and child in the underlying storage (in-memory in this
+	/// implementation).
+	/// @see IFilesystemNodeOperations::preserveEdge
+	void preserveEdge(const FilesystemOperationContext &fsOpContext, FSNodeDirectory *parent,
+	                  FSNode *child, hstorage::Handle *handlePtr) override;
+
+	/// Updates owner quota usage for node mutations.
+	/// In-memory backend applies updates directly to quota structures.
+	/// KV backend can override to persist counters in the active transaction.
+	virtual void nodeQuotaUpdate(
+	    const FilesystemOperationContext &fsOpContext, FSNode *node,
+	    const std::initializer_list<std::pair<QuotaResource, int64_t>> &resourceList);
+
+	/// Removes all quota tuples for a specific owner.
+	/// In-memory backend removes from quota database.
+	/// KV backend can override to remove owner keys from persistent storage.
+	virtual void nodeQuotaRemove(const FilesystemOperationContext &fsOpContext,
+	                             QuotaOwnerType ownerType, inode_t ownerId);
+
+private:
+	// Private helpers
+
+	void removeNode(const FilesystemOperationContext &fsOpContext, uint32_t timeStamp,
+	                FSNode *node);
+
+	/// Number of blocks in the last chunk before EOF
+	static uint32_t lastChunkBlocks(FSNodeFile *node);
+
+	/// Does the last chunk exist and contain non-zero data?
+	static bool isLastChunkNonEmpty(FSNodeFile *node);
+
+	/// Count chunks in a file, disregard sparse file holes
+	static uint32_t fileChunksCount(FSNodeFile *node);
+
+	/// Compute the "size" statistic for a file node
+	static uint64_t fileSize(FSNodeFile *node, uint32_t nonZeroChunks);
+
+	/// Compute the "realsize" statistic for a file node.
+	/// @param node file node (used e.g. to detect a partial last chunk and goal).
+	/// @param nonZeroChunks number of non-empty chunks (used for EC/XOR slice calculations).
+	/// @param logicalFileSize logical file "size" as returned by fileSize(...).
+	static uint64_t fileRealSize(FSNodeFile *node, uint32_t nonZeroChunks,
+	                             uint64_t logicalFileSize);
+
+#ifndef METARESTORE
+	/// Compute the disk space cost of all parts of a xor/ec chunk of given size
+	static uint32_t ecChunkRealSize(uint32_t blocks, uint32_t dataPartCount,
+	                                uint32_t parityPartCount);
+#endif
+};

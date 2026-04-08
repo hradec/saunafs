@@ -32,8 +32,6 @@
 #include "chunkserver/buffers_pool.h"
 #include "common/aligned_allocator.h"
 
-constexpr uint8_t kNotSaunafsStatus = 255;
-
 inline std::atomic<uint32_t> gCurrentTotalOutputBufferBlocks = 0;
 inline std::atomic<uint32_t> gCurrentTotalInputBufferBlocks = 0;
 inline std::atomic<uint32_t> gCurrentTotalReplicatorBufferBlocks = 0;
@@ -111,6 +109,15 @@ public:
 			bytes_written += ret;
 		}
 		return bytes_written;
+	}
+
+	/// @brief Overwrites data in the buffer at the given offset.
+	/// @param offset The offset to overwrite the data at.
+	/// @param mem The memory to copy the data from.
+	/// @param len The length of the data to copy.
+	void overwriteInterval(size_t offset, const void *mem, size_t len) {
+		eassert(offset + len <= capacity_);
+		memcpy((void *)&data_[offset + padding_], mem, len);
 	}
 
 	ssize_t readFromFD(int sock, size_t len) {
@@ -284,17 +291,28 @@ public:
 	/// @brief Clears the buffer.
 	void clear();
 
-	/// @brief Returns the `status` in a thread-safe manner.
-	uint8_t getStatus() {
-		std::lock_guard<std::mutex> lock(mutex_);
-		return status;
+	/// @brief Returns the `isCallbackStarted` flag.
+	/// Whether the buffer's related callback has started processing or has been processed.
+	bool isCallbackStarted() const { return isCallbackStarted_; }
+
+	/// @brief Sets the `isProcessed` flag.
+	void setIsCallbackStarted(bool newIsCallbackStarted) {
+		isCallbackStarted_ = newIsCallbackStarted;
 	}
 
-	/// @brief Sets the `status` in a thread-safe manner.
-	void setStatus(uint8_t newStatus) {
-		std::lock_guard<std::mutex> lock(mutex_);
-		status = newStatus;
-	}
+	/// @brief Updates the block data in the buffer for the given block index and the offset and
+	/// size in the block.
+	/// @param blockIndex The index of the block to update.
+	/// @param offsetInBlock The offset within the block to start updating.
+	/// @param sizeInBlock The size of the data to update within the block.
+	/// @param mem The memory containing the data to update.
+	void updateIntervalBlockData(size_t blockIndex, size_t offsetInBlock, size_t sizeInBlock,
+	                             const void *mem);
+
+	/// @brief Updates the CRC of the block in the buffer for the given block index and size.
+	/// @param blockIndex The index of the block to update the CRC for.
+	/// @param size The size of the data block to update its CRC.
+	void updateBlockCRC(size_t blockIndex, size_t size);
 
 private:
 	/// The current remaining bytes to be written to the file descriptor at once.
@@ -306,11 +324,8 @@ private:
 	/// The number of blocks.
 	const size_t numBlocks_;
 
-	/// Protects the `status` member variable used for custom thread synchronization.
-	std::mutex mutex_;
-
-	/// Status of the buffer's related read operation.
-	uint8_t status{kNotSaunafsStatus};
+	/// Whether the buffer's related callback has started processing or has been processed.
+	bool isCallbackStarted_{false};
 
 	/// The buffer for the block data.
 	Buffer<std::vector<uint8_t, AlignedAllocator<uint8_t, disk::kIoBlockSize>>> blockBuffer_;
@@ -370,20 +385,10 @@ struct WriteOperation {
  * supposed to have the same length, which must be provided during the buffer creation.
  *
  * The InputBuffer is prepared to be updated with new data read from the file descriptor while
- * being processed by the JobPool workers. The protection is done by the `state_` member variable
- * and the `mutex_` mutex.
+ * being processed by the JobPool workers.
  */
 class InputBuffer {
 public:
-	enum class WriteState : uint8_t {
-		Available,     ///< Just created, can receive new write operations.
-		Inqueue,       ///< In the JobPool queue, waiting for processing.
-		InProgress,    ///< Currently being processed, i.e. writing to the disk.
-		BeingUpdated,  ///< The buffer is being updated, i.e. new blocks are being added.
-		BeingUpdatedInqueue,  ///< The buffer is being updated, but it is in the JobPool queue.
-		Finished              ///< The buffer is finished, all write operations are done.
-	};
-
 	/// @enum BufferType
 	/// @brief Represents the type of buffer.
 	enum class BufferType : uint8_t {
@@ -396,10 +401,9 @@ public:
 	/// @param numBlocks The number of blocks.
 	explicit InputBuffer(size_t headerSize, size_t numBlocks);
 
-	/// @brief Destructor only decreases the global counter of input buffers blocks.
-	~InputBuffer() {
-		gCurrentTotalInputBufferBlocks -= numBlocks_;
-	}
+	/// @brief Destructor only decreases the global counter of input buffers blocks and write
+	/// buffering blocks.
+	~InputBuffer();
 
 	/// @brief Reads at most `bytesToRead` bytes from the socket.
 	/// It puts the data into the header buffer if not already filled considering the
@@ -465,45 +469,36 @@ public:
 	/// @return The vector of statuses along with write IDs.
 	std::vector<std::pair<uint8_t, uint32_t>> getStatuses() const;
 
-	/// @brief Checks if the buffer can receive a new write operation and locks it.
-	/// Sets the state to WriteState::BeingUpdatedInqueue or WriteState::BeingUpdated.
-	/// @return True if the buffer can receive a new write operation, false otherwise.
-	bool canReceiveNewWriteOperationAndLock();
-
-	/// @brief Ends the update of the buffer and unlocks it.
-	/// It sets the state to WriteState::Inqueue or WriteState::Available,
-	/// and notifies the JobPool workers that could be waiting for the end of the update.
-	/// Should be called after the last write operation is set up or the csentry is being closed.
-	/// @param isGracefulEndUpdate If `isGracefulEndUpdate` is true, it prints a warning if the
-	/// buffer is not in WriteState::BeingUpdatedInqueue or WriteState::BeingUpdated.
-	void endUpdateAndUnlock(bool isGracefulEndUpdate);
-
-	/// @brief Waits for the end of the update and returns true if the state is consistent.
-	/// If the state is not consistent, it returns false and prints a warning.
-	/// This function is used to ensure that the buffer is in a consistent state before
-	/// performing the operations it holds. It sets the state to WriteState::InProgress when
-	/// successful.
-	/// @return True if the state is consistent, false otherwise.
-	bool waitForEndUpdateIfNecessary();
-
-	/// @brief Sets the state to WriteState::Finished.
-	void setFinished();
-
 	/// @brief Returns whether the header size is the expected one.
 	bool isHeaderSizeValid() const;
+
+	/// @brief Returns the write ID of the last write operation.
+	uint32_t getLastWriteId() const;
+
+	/// @brief Returns whether the buffer is full, i.e. has numBlocks_ write operations.
+	bool isFull() const;
+
+	/// @brief Returns whether the buffer is currently being updated (reading from socket).
+	bool isBeingUpdated() const;
+
+	/// @brief Number of blocks that have been replied to the client.
+	std::atomic<uint16_t> repliedBlocks{0};
+
+	/// @brief Returns the current number of blocks in the buffer.
+	size_t currentBlocks() const { return writeInfo_.size(); }
+
+	/// @brief Returns the vector of WriteInfo for the write operations in the buffer.
+	std::vector<WriteInfo> &getWriteInfoVector() { return writeInfo_; }
+
+	/// @brief Returns the pointer to the block data in the buffer for the given block index and
+	/// offset in the block.
+	const uint8_t *getBlockBufferData(size_t blockIndex, size_t offsetInBlock) const;
 
 protected:
 	const size_t headerSize_;  ///< The size of the header.
 	const size_t numBlocks_;   ///< The number of blocks.
 
-	/// Protects the `state` member variable used for custom thread synchronization.
-	mutable std::mutex mutex_;
-
-	/// Condition variable to wait for the end of the update.
-	std::condition_variable startWriteCV_;
-
-	/// Status of the buffer's related read operation.
-	std::atomic<WriteState> state_{WriteState::Available};
+	bool isBeingUpdated_{false};
 
 	/// The buffer for the block data.
 	Buffer<std::vector<uint8_t, AlignedAllocator<uint8_t, disk::kIoBlockSize>>> blockBuffer_;
@@ -584,4 +579,21 @@ inline ReplicatorBufferPool &getReplicateBuffersPool() {
 	return replicateBuffersPool;
 }
 
+/// @brief Releases the old IO buffers that have been in the pool for longer than the given
+/// expiration time.
+/// @param expirationTime_ms The expiration time in milliseconds.
 void releaseOldIoBuffers(uint32_t expirationTime_ms);
+
+/// @brief Sets the new maximum size of the IO buffers pool in megabytes.
+/// @param maxBuffersPoolSize_mb The new maximum size in megabytes.
+void setNewMaxIoBuffersPoolSize(size_t maxBuffersPoolSize_mb);
+
+/// @brief Modifies the number of available write buffering blocks by the given value.
+/// @param blocks The value to modify the number of available write buffering blocks by.
+void modifyAvailableWriteBufferingBlocks(int32_t blocks);
+
+/// @brief Returns the current number of available write buffering blocks.
+/// This is the number of blocks that can be currently buffered for write operations, i.e. the
+/// number of blocks that can be currently in the input buffers for write operations before they are
+/// flushed to the disk.
+int32_t getAvailableWriteBufferingBlocks();

@@ -34,18 +34,26 @@
 #include "master/changelog.h"
 #include "master/chunks.h"
 #include "master/datacachemgr.h"
+#include "master/deferred_metadata_dump_task.h"
 #include "master/filesystem_checksum_updater.h"
 #include "master/filesystem_metadata.h"
+#include "master/filesystem_node.h"
 #include "master/filesystem_operations.h"
+#include "master/filesystem_operations_interface.h"
 #include "master/filesystem_periodic.h"
 #include "master/filesystem_snapshot.h"
 #include "master/goal_config_loader.h"
-#include "master/matoclserv.h"
+#include "master/id_generator_incremental.h"
+#include "master/matoclserv_sessions.h"
 #include "master/metadata_backend_common.h"
-#include "master/metadata_backend_file.h"
 #include "master/metadata_backend_interface.h"
 #include "master/restore.h"
 #include "slogger/slogger.h"
+
+#ifdef METARESTORE
+#include "master/filesystem_freenode.h"
+#include "master/metadata_backend_file.h"
+#endif
 
 FilesystemMetadata* gMetadata = nullptr;
 std::unique_ptr<Lockfile> gMetadataLockfile;
@@ -110,7 +118,7 @@ static void metadataPollServe(const std::vector<pollfd> &pdesc) {
 			if (dumper->useMetarestore()) {
 				// master should recalculate its checksum
 				safs_pretty_syslog(LOG_WARNING, "dumping metadata failed, recalculating checksum");
-				fs_start_checksum_recalculation();
+				gFSOperations->startChecksumRecalculation();
 			}
 			unlink(kMetadataTmpFilename);
 		}
@@ -206,8 +214,26 @@ void fs_term(const char *fname, bool noLock) {
 }
 #endif
 
-void fs_strinit(void) {
-	gMetadata = new FilesystemMetadata;
+void fs_strinit(bool isFromInit) {
+	if (isFromInit) {
+		if (gMetadata == nullptr) { gMetadata = new FilesystemMetadata; }
+	} else {
+		// Could be called from masterconn in Shadow mode
+		gMetadata = new FilesystemMetadata;
+	}
+}
+
+static void ensureChunkIdGenerator() {
+	if (!gChunkIdGenerator) {
+		gChunkIdGenerator = std::make_unique<IdGeneratorIncremental<uint64_t>>();
+	}
+}
+
+static void initFSOperations() {
+	if (!gFSOperations) {
+		auto nodeOps = std::make_unique<FilesystemNodeOperationsBase>();
+		gFSOperations = std::make_unique<FilesystemOperationsBase>(std::move(nodeOps));
+	}
 }
 
 /* executed in master mode */
@@ -224,9 +250,51 @@ void fs_erase_message_from_lockfile() {
 	}
 }
 
-int fs_loadall(void) {
-	fs_strinit();
+/// @brief Executes a metadata dump operation, either immediately or deferred.
+///
+/// This function checks for the "defer-metadata-dump" option. If present, it schedules
+/// a deferred metadata dump task using the TaskManager, logging the outcome upon completion.
+/// Otherwise, it performs an immediate metadata dump after applying changelogs.
+///
+/// The deferred dump uses the global metadata backend and submits a one-time task.
+/// The immediate dump invokes the metadata backend's fs_storeall() function with a foreground dump
+/// type.
+///
+/// Logging is performed to indicate the success or failure of the operation.
+void executeMetadataDump() {
+	bool deferDump = main_has_extra_argument("defer-metadata-dump", CaseSensitivity::kIgnore);
+
+	if (deferDump) {
+		safs::log_info("Deferring metadata dump option detected");
+
+		auto *metadataBackendPtr = gMetadataBackend.get();
+		auto metadataDumpTask = std::make_unique<DeferredMetadataDumpTask>(metadataBackendPtr);
+
+		// Schedule one-time deferred metadata dump task using TaskManager
+		gMetadata->taskManager.submitTask(
+		    0, 1, metadataDumpTask.release(), DeferredMetadataDumpTask::generateDescription(),
+		    [](int status) {
+			    if (status == SAUNAFS_STATUS_OK) {
+				    safs::log_info("Deferred metadata dump completed successfully");
+			    } else {
+				    safs::log_err("Deferred metadata dump failed with status: {}", status);
+			    }
+		    });
+	} else {
+		// Original behavior: dump the new metadata immediately
+		gMetadataBackend->fs_storeall(DumpType::kForegroundDump);
+		safs::log_info("Metadata dumped successfully after applying changelogs");
+	}
+}
+
+int fs_loadall(bool isFromInit = true) {
+	fs_strinit(isFromInit);
+
+	ensureChunkIdGenerator();
 	chunk_strinit();
+
+	gChunkIdGenerator->initialize();
+	gInodeIdGenerator->initialize();
 
 	{
 		auto scopedTimer = util::ScopedTimer("metadata load time");
@@ -250,8 +318,7 @@ int fs_loadall(void) {
 		safs::log_info("all needed changelogs applied successfully");
 
 		// Dump the new metadata
-		gMetadataBackend->fs_storeall(DumpType::kForegroundDump);
-		safs::log_info("Metadata dumped successfully after applying changelogs");
+		executeMetadataDump();
 
 		// Restore the original personality
 		metadataserver::setPersonality(personality);
@@ -373,7 +440,8 @@ void fs_reload(void) {
 }
 
 void fs_unload() {
-	safs_pretty_syslog(LOG_WARNING, "unloading filesystem at %" PRIu64, fs_getversion());
+	safs_pretty_syslog(LOG_WARNING, "unloading filesystem at %" PRIu64,
+	                   gFSOperations->getMetadataVersion());
 	restore_reset();
 	matoclserv_session_unload();
 	chunk_unload();
@@ -389,6 +457,9 @@ int fs_init(bool doLoad) {
 		safs::log_err("Error in configuration: {}", ex.what());
 		throw;
 	}
+
+	// Initialize the concrete filesystem operations before any FS call
+	initFSOperations();
 
 	if (!gMetadataLockfile) {
 		gMetadataLockfile = std::make_unique<Lockfile>(kMetadataFilename + std::string(".lock"));
@@ -413,7 +484,7 @@ int fs_init(bool doLoad) {
 	changelog_init(kChangelogFilename, 0, 50);
 
 	if (doLoad || (metadataserver::isMaster())) {
-		fs_loadall();
+		fs_loadall(true);
 	}
 
 	eventloop_reloadregister(fs_reload);
@@ -447,12 +518,18 @@ int fs_init(const char *fname, int ignoreflag, bool noLock) {
 	gMetadataBackend = std::make_unique<MetadataBackendFile>();
 	dynamic_cast<MetadataBackendFile *>(gMetadataBackend.get())->setMetadataFile(fname);
 
+	// Initialize the concrete filesystem operations before any FS call
+	initFSOperations();
+
 	if (!noLock) {
 		gMetadataLockfile.reset(new Lockfile(fs::dirname(fname) + "/" + kMetadataFilename + ".lock"));
 		gMetadataLockfile->lock(Lockfile::StaleLock::kSwallow);
 	}
-	fs_strinit();
+
+	fs_strinit(true);
+	ensureChunkIdGenerator();
 	chunk_strinit();
+	gInodeIdGenerator = std::make_unique<IdGeneratorWithDetainer>();
 	gMetadataBackend->loadall(ignoreflag);
 	return 0;
 }

@@ -69,9 +69,9 @@ test_end() {
 		remove_all_emulated_zoned_disks
 	fi
 
-	if [[ ${USE_FDB:-} ]]; then
-		stop_fdb_cluster
-		echo "FoundationDB cluster has been stopped."
+	# Clean up FDB cluster if one was started for this test.
+	if [[ ${fdb_cluster_started:-} ]]; then
+		cleanup_fdb_cluster
 	fi
 
 	local errors=$(cat "$test_result_file")
@@ -128,7 +128,7 @@ test_begin() {
 	test_cleanup
 	remove_all_emulated_zoned_disks
 	touch "$test_result_file"
-	trap 'trap - ERR; set +eE; catch_error_ "${BASH_SOURCE:-}" "${LINENO:-}" "${FUNCNAME:-}"; exit 1' ERR
+	trap 'trap - ERR; set +eE; catch_error_ "${BASH_SOURCE:-}" "${LINENO:-}" "${FUNCNAME:-}"; test_end' ERR
 	set -E
 	timeout_init
 	system_init

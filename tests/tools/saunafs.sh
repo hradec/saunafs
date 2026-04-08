@@ -29,6 +29,13 @@ setup_local_empty_saunafs() {
 	declare -gA saunafs_info_
 	saunafs_info_[chunkserver_count]=$number_of_chunkservers
 	saunafs_info_[admin_password]=${ADMIN_PASSWORD:-password}
+	saunafs_info_[metadata_backend]="${metadata_backend}"
+
+	declare -g mds_command="sfsmaster"
+
+	if [[ ${metadata_backend} != "FILE" ]]; then
+		mds_command="sfsmds"
+	fi
 
 	if is_windows_system; then
 		saunafs_info_[is_windows_system]=1
@@ -112,7 +119,9 @@ setup_local_empty_saunafs() {
 	export PATH="$oldpath"
 
 	# Add shadow master if not present (and not disabled); wait for it to synchronize
-	if [[ $auto_shadow_master == YES && $number_of_masterservers == 1 ]]; then
+	if [[ $auto_shadow_master == YES && \
+	      $number_of_masterservers == 1 && \
+	      ${saunafs_info_[metadata_backend]} == "FILE" ]]; then
 		add_metadata_server_ auto "shadow"
 		saunafs_master_n auto start ${shadow_start_param}
 		if ! [[ ${saunafs_info_[is_windows_system]} -eq 1 ]]; then
@@ -141,10 +150,8 @@ setup_local_empty_saunafs() {
 }
 
 init_metadata_backend() {
-	case ${metadata_backend} in
+	case ${saunafs_info_[metadata_backend]} in
 		"FDB")
-			declare -g USE_FDB="${metadata_backend}"
-			export USE_FDB
 			start_fdb_cluster
 			;;
 	esac
@@ -199,9 +206,9 @@ saunafs_chunkserver_daemon() {
 
 saunafs_master_daemon() {
 	if [[ ${saunafs_info_[is_windows_system]} -eq 1 ]]; then
-		windows_server_aux "sfsmaster -c ${saunafs_info_[master${saunafs_info_[current_master]}_cfg]}" "$@"
+		windows_server_aux "${mds_command} -c ${saunafs_info_[master${saunafs_info_[current_master]}_cfg]}" "$@"
 	else
-		sfsmaster -c "${saunafs_info_[master${saunafs_info_[current_master]}_cfg]}" "$@" | cat
+		${mds_command} -c "${saunafs_info_[master${saunafs_info_[current_master]}_cfg]}" "$@" | cat
 	fi
 	return ${PIPESTATUS[0]}
 }
@@ -211,9 +218,9 @@ saunafs_master_n() {
 	local id=$1
 	shift
 	if [[ ${saunafs_info_[is_windows_system]} -eq 1 ]]; then
-		windows_server_aux "sfsmaster -c ${saunafs_info_[master${id}_cfg]}" "$@"
+		windows_server_aux "${mds_command} -c ${saunafs_info_[master${id}_cfg]}" "$@"
 	else
-		sfsmaster -c "${saunafs_info_[master${id}_cfg]}" "$@" | cat
+		${mds_command} -c "${saunafs_info_[master${id}_cfg]}" "$@" | cat
 	fi
 	return ${PIPESTATUS[0]}
 }
@@ -348,7 +355,7 @@ create_bdb_name_storage_entry_() {
 	fi
 }
 
-create_sfsmaster_master_cfg_() {
+create_mds_common_cfg_() {
 	local this_module_cfg_variable="MASTER_${masterserver_id}_EXTRA_CONFIG"
 	echo "PERSONALITY = master"
 	echo "SYSLOG_IDENT = master_${masterserver_id}"
@@ -357,18 +364,51 @@ create_sfsmaster_master_cfg_() {
 	echo "EXPORTS_FILENAME = ${saunafs_info_[master_exports]}"
 	echo "TOPOLOGY_FILENAME = ${saunafs_info_[master_topology]}"
 	echo "CUSTOM_GOALS_FILENAME = ${saunafs_info_[master_custom_goals]}"
-	echo "DATA_PATH = $masterserver_data_path"
+	echo "DATA_PATH = ${masterserver_data_path}"
+	echo "ADMIN_PASSWORD = ${saunafs_info_[admin_password]}"
+	echo "USE_CHUNKSERVER_SIDE_CHUNK_LOCK = 1"
+	create_magic_debug_log_entry_ "master_${masterserver_id}"
+	echo "${MASTER_EXTRA_CONFIG-}" | tr '|' '\n'
+	echo "${!this_module_cfg_variable-}" | tr '|' '\n'
+	create_bdb_name_storage_entry_
+	echo "METADATA_BACKEND = ${saunafs_info_[metadata_backend]}"
+}
+
+add_lines_master_cfg_() {
+	lines=$1
+	lines_with_newline=$(echo "${lines}" | tr '|' '\n')
+	echo "${lines_with_newline}" >> "${saunafs_info_[master${saunafs_info_[current_master]}_cfg]}"
+}
+
+create_sfsmaster_master_cfg_() {
+	create_mds_common_cfg_
+	echo "MATONT_LISTEN_PORT = ${saunafs_info_[matont]}"
 	echo "MATOML_LISTEN_PORT = ${saunafs_info_[matoml]}"
 	echo "MATOCS_LISTEN_PORT = ${saunafs_info_[matocs]}"
 	echo "MATOCL_LISTEN_PORT = ${saunafs_info_[matocl]}"
 	echo "MATOTS_LISTEN_PORT = ${saunafs_info_[matots]}"
 	echo "METADATA_CHECKSUM_INTERVAL = 1"
-	echo "ADMIN_PASSWORD = ${saunafs_info_[admin_password]}"
-	create_magic_debug_log_entry_ "master_${masterserver_id}"
-	echo "${MASTER_EXTRA_CONFIG-}" | tr '|' '\n'
-	echo "${!this_module_cfg_variable-}" | tr '|' '\n'
-	create_bdb_name_storage_entry_
-	echo "METADATA_BACKEND = ${metadata_backend}"
+}
+
+create_sfsmds_cfg_() {
+	create_mds_common_cfg_
+	# MDS 0 uses global ports (for client/chunkserver connections)
+	# Other MDSs will use their own local ports (like shadows do)
+	if [[ ${masterserver_id} -eq 0 ]]; then
+		echo "MATONT_LISTEN_PORT = ${saunafs_info_[matont]}"
+		echo "MATOML_LISTEN_PORT = ${saunafs_info_[matoml]}"
+		echo "MATOCS_LISTEN_PORT = ${saunafs_info_[matocs]}"
+		echo "MATOCL_LISTEN_PORT = ${saunafs_info_[matocl]}"
+		echo "MATOTS_LISTEN_PORT = ${saunafs_info_[matots]}"
+	else
+		echo "MATONT_LISTEN_PORT = ${masterserver_matont_port}"
+		echo "MATOML_LISTEN_PORT = ${masterserver_matoml_port}"
+		echo "MATOCS_LISTEN_PORT = ${masterserver_matocs_port}"
+		echo "MATOCL_LISTEN_PORT = ${masterserver_matocl_port}"
+		echo "MATOTS_LISTEN_PORT = ${masterserver_matots_port}"
+	fi
+
+	echo "FDB_CLUSTER_FILE = /tmp/saunafs-fdb-test/conf/fdb.cluster"
 }
 
 create_sfsmaster_shadow_cfg_() {
@@ -380,11 +420,12 @@ create_sfsmaster_shadow_cfg_() {
 	echo "EXPORTS_FILENAME = ${saunafs_info_[master_exports]}"
 	echo "TOPOLOGY_FILENAME = ${saunafs_info_[master_topology]}"
 	echo "CUSTOM_GOALS_FILENAME = ${saunafs_info_[master_custom_goals]}"
-	echo "DATA_PATH = $masterserver_data_path"
-	echo "MATOML_LISTEN_PORT = $masterserver_matoml_port"
-	echo "MATOCS_LISTEN_PORT = $masterserver_matocs_port"
-	echo "MATOCL_LISTEN_PORT = $masterserver_matocl_port"
-	echo "MATOTS_LISTEN_PORT = $masterserver_matots_port"
+	echo "DATA_PATH = ${masterserver_data_path}"
+	echo "MATONT_LISTEN_PORT = ${masterserver_matont_port}"
+	echo "MATOML_LISTEN_PORT = ${masterserver_matoml_port}"
+	echo "MATOCS_LISTEN_PORT = ${masterserver_matocs_port}"
+	echo "MATOCL_LISTEN_PORT = ${masterserver_matocl_port}"
+	echo "MATOTS_LISTEN_PORT = ${masterserver_matots_port}"
 	echo "MASTER_HOST = $(get_ip_addr)"
 	echo "MASTER_PORT = ${saunafs_info_[matoml]}"
 	echo "METADATA_CHECKSUM_INTERVAL = 1"
@@ -393,7 +434,7 @@ create_sfsmaster_shadow_cfg_() {
 	echo "${MASTER_EXTRA_CONFIG-}" | tr '|' '\n'
 	echo "${!this_module_cfg_variable-}" | tr '|' '\n'
 	create_bdb_name_storage_entry_
-	echo "METADATA_BACKEND = ${metadata_backend}"
+	echo "METADATA_BACKEND = ${saunafs_info_[metadata_backend]}"
 }
 
 saunafs_make_conf_for_shadow() {
@@ -422,6 +463,7 @@ prepare_common_metadata_server_files_() {
 	saunafs_info_[master_exports]="$etcdir/sfsexports.cfg"
 	saunafs_info_[master_topology]="$etcdir/sfstopology.cfg"
 	saunafs_info_[master_custom_goals]="$etcdir/sfsgoals.cfg"
+	get_next_port_number "saunafs_info_[matont]"
 	get_next_port_number "saunafs_info_[matoml]"
 	get_next_port_number "saunafs_info_[matocl]"
 	get_next_port_number "saunafs_info_[matocs]"
@@ -432,15 +474,18 @@ add_metadata_server_() {
 	local masterserver_id=$1
 	local personality=$2
 
+	local masterserver_matont_port
 	local masterserver_matoml_port
 	local masterserver_matocl_port
 	local masterserver_matocs_port
 	local masterserver_matots_port
 	local masterserver_data_path=$vardir/master${masterserver_id}
 	local masterserver_master_cfg=$etcdir/sfsmaster${masterserver_id}_master.cfg
+	local masterserver_mds_cfg=$etcdir/sfsmaster${masterserver_id}_mds.cfg
 	local masterserver_shadow_cfg=$etcdir/sfsmaster${masterserver_id}_shadow.cfg
 	local masterserver_cfg=$etcdir/sfsmaster${masterserver_id}.cfg
 
+	get_next_port_number masterserver_matont_port
 	get_next_port_number masterserver_matoml_port
 	get_next_port_number masterserver_matocl_port
 	get_next_port_number masterserver_matocs_port
@@ -449,23 +494,29 @@ add_metadata_server_() {
 	create_sfsmaster_master_cfg_ >"$masterserver_master_cfg"
 	create_sfsmaster_shadow_cfg_ >"$masterserver_shadow_cfg"
 
-	if [[ "$personality" == "master" ]]; then
-		cp "$masterserver_master_cfg" "$masterserver_cfg"
-		echo -n 'SFSM NEW' >"$masterserver_data_path/metadata.sfs"
-	elif [[ "$personality" == "shadow" ]]; then
-		cp "$masterserver_shadow_cfg" "$masterserver_cfg"
-	else
-		test_fail "Wrong personality $personality"
+	if [[ "${saunafs_info_[metadata_backend]}" == "FILE" ]]; then
+		if [[ "$personality" == "master" ]]; then
+			cp "$masterserver_master_cfg" "$masterserver_cfg"
+			echo -n 'SFSM NEW' >"$masterserver_data_path/metadata.sfs"
+		elif [[ "$personality" == "shadow" ]]; then
+			cp "$masterserver_shadow_cfg" "$masterserver_cfg"
+		else
+			test_fail "Wrong personality $personality"
+		fi
+	elif [[ "${saunafs_info_[metadata_backend]}" == "FDB" ]]; then
+		create_sfsmds_cfg_ >"$masterserver_mds_cfg"
+		cp "$masterserver_mds_cfg" "$masterserver_cfg"
 	fi
 
 	saunafs_info_[master${masterserver_id}_shadow_cfg]=$masterserver_shadow_cfg
 	saunafs_info_[master${masterserver_id}_master_cfg]=$masterserver_master_cfg
 	saunafs_info_[master${masterserver_id}_cfg]=$masterserver_cfg
 	saunafs_info_[master${masterserver_id}_data_path]=$masterserver_data_path
+	saunafs_info_[master${masterserver_id}_matont]=$masterserver_matont_port
 	saunafs_info_[master${masterserver_id}_matoml]=$masterserver_matoml_port
 	saunafs_info_[master${masterserver_id}_matocl]=$masterserver_matocl_port
 	saunafs_info_[master${masterserver_id}_matocs]=$masterserver_matocs_port
-	saunafs_info_[master${masterserver_id}_matots]=$masterserver_matocs_port
+	saunafs_info_[master${masterserver_id}_matots]=$masterserver_matots_port
 }
 
 create_sfsmetalogger_cfg_() {
@@ -631,6 +682,7 @@ create_sfschunkserver_cfg_() {
 	echo "MASTER_HOST = $ip_address"
 	echo "MASTER_PORT = ${saunafs_info_[matocs]}"
 	echo "CSSERV_LISTEN_PORT = $csserv_port"
+	echo "WRITE_BUFFERING_SIZE_MB = 64"
 	create_chunkserver_label_entry_ "${chunkserver_id}"
 	create_magic_debug_log_entry_ "chunkserver_${chunkserver_id}"
 	echo "${CHUNKSERVER_EXTRA_CONFIG-}" | tr '|' '\n'
@@ -875,19 +927,39 @@ get_current_master_sessions_file() {
   echo "${saunafs_info_[master${saunafs_info_[current_master]}_data_path]}/sessions.sfs"
 }
 
+# print enabled chunkserver hdd paths on selected server, one per line
+get_chunkserver_hdds_() {
+	local chunkserver_number=$1
+
+	sed -E \
+		-e '/^[[:space:]]*#/d' \
+		-e '/^[[:space:]]*$/d' \
+		-e 's/\*//g' \
+		-e 's/^zonefs://' \
+		-e 's/\|.*$//' \
+		-e 's/[[:space:]]+$//' \
+		"${saunafs_info_[chunkserver${chunkserver_number}_hdd]}"
+}
+
 # print absolute paths of all chunk files on selected server, one per line
 find_chunkserver_chunks() {
 	local chunkserver_number=$1
 	local chunk_metadata_pattern="chunk*${chunk_metadata_extension}"
 	local chunk_data_pattern="chunk*${chunk_data_extension}"
 	shift
-	local hdds=$(sed -e 's/*//' -e 's/zonefs://' -e 's/|//' \
-		${saunafs_info_[chunkserver${chunkserver_number}_hdd]})
+
+	local hdds
+	hdds=$(get_chunkserver_hdds_ ${chunkserver_number})
+
+	if [[ -z ${hdds} ]]; then
+		return 0
+	fi
+
 	if (($# > 0)); then
-		find $hdds "(" -name "${chunk_data_pattern}" \
+		find ${hdds} "(" -name "${chunk_data_pattern}" \
 			-o -name "${chunk_metadata_pattern}" ")" -a "(" "$@" ")"
 	else
-		find $hdds "(" -name "${chunk_data_pattern}" \
+		find ${hdds} "(" -name "${chunk_data_pattern}" \
 			-o -name "${chunk_metadata_pattern}" ")"
 	fi
 }
@@ -898,15 +970,19 @@ find_chunkserver_metadata_chunks() {
 	local chunk_metadata_pattern="chunk*${chunk_metadata_extension}"
 	shift
 
-	local hdds=$(sed -e 's/*//' -e 's/zonefs://' -e 's/|//' \
-		${saunafs_info_[chunkserver${chunkserver_number}_hdd]})
+	local hdds
+	hdds=$(get_chunkserver_hdds_ ${chunkserver_number})
+
+	if [[ -z ${hdds} ]]; then
+		return 0
+	fi
 
 	local -a extended_args=()
 	if (($# > 0)); then
 		extended_args+=(-a "(" "$@" ")")
 	fi
 
-	find $hdds "(" -name "${chunk_metadata_pattern}" ")" "${extended_args[@]}"
+	find ${hdds} "(" -name "${chunk_metadata_pattern}" ")" "${extended_args[@]}"
 }
 
 # print absolute paths of all chunk files on all servers used in test, one per line
@@ -914,7 +990,7 @@ find_all_chunks() {
 	local count=${saunafs_info_[chunkserver_count]}
 	local chunkserver
 	for ((chunkserver = 0; chunkserver < count; ++chunkserver)); do
-		find_chunkserver_chunks $chunkserver "$@"
+		find_chunkserver_chunks ${chunkserver} "$@"
 	done
 }
 
@@ -923,10 +999,9 @@ find_all_metadata_chunks() {
 	local count=${saunafs_info_[chunkserver_count]}
 	local chunkserver
 	for ((chunkserver = 0; chunkserver < count; ++chunkserver)); do
-		find_chunkserver_metadata_chunks $chunkserver "$@"
+		find_chunkserver_metadata_chunks ${chunkserver} "$@"
 	done
 }
-
 
 # print absolute paths of all trashed chunk files on selected server, one per
 # line
@@ -935,12 +1010,17 @@ find_chunkserver_trashed_chunks() {
 	local chunk_metadata_pattern="chunk*${chunk_metadata_extension}.*"
 	local chunk_data_pattern="chunk*${chunk_data_extension}.*"
 	shift
-	local trash_bins=$(sed -E \
-	  -e 's/\*//' \
-	  -e 's/zonefs://' \
-	  -e 's/\|//' \
-	  -e 's@\/?$@/.trash.bin/@' \
-		${saunafs_info_[chunkserver${chunkserver_number}_hdd]})
+
+	local trash_bins
+	trash_bins=$(
+		get_chunkserver_hdds_ ${chunkserver_number} | sed -E \
+			-e 's@/?$@/.trash.bin/@'
+	)
+
+	if [[ -z ${trash_bins} ]]; then
+		return 0
+	fi
+
 	if (($# > 0)); then
 		find ${trash_bins} "(" -name "${chunk_data_pattern}" \
 			-o -name "${chunk_metadata_pattern}" ")" -a "(" "$@" ")"
@@ -1066,6 +1146,9 @@ function is_zoned_device() {
 # Adds around 15s to the test.
 sfschunkserver_check_no_buffer_in_use() {
 	# Make sure some time passes to get dead csentries cleaned up
+	add_lines_master_cfg_ "CHUNKS_WRITE_REP_LIMIT = 1|CHUNKS_READ_REP_LIMIT = 1|`
+		`CHUNKS_LOOP_MIN_TIME = 10000"
+	saunafs_master_daemon reload
 	sleep 10
 
 	chunkserver_count=${saunafs_info_[chunkserver_count]}
@@ -1091,4 +1174,30 @@ sfschunkserver_check_no_buffer_in_use() {
 
 	assert_equals "${chunkserver_count}" "${full_zeroes}"
 	assert_equals "${chunkserver_count}" "${unique_count}"
+}
+
+# The output lines from `dirinfo` and `admin info` are formatted as:
+# "key (possibly with spaces): value"
+# For example: "FS objects: 5"
+# Uses awk (instead of grep/cut) to match the label exactly in field 1.
+# This avoids collisions like "size" matching "realsize" and trims whitespace safely.
+function get_value_from_dirinfo_and_admin_info() {
+	local content="${1}"
+	local key="${2}"
+	echo "${content}" | awk -F: -v key="${key}" '
+		/:/ {
+			label = $1
+			sub(/^[[:space:]]+/, "", label)
+			sub(/[[:space:]]+$/, "", label)
+
+			# Exact key match on label (left side of ":").
+			if (label == key) {
+				value = $0
+				sub(/^[^:]*:[[:space:]]*/, "", value)
+				sub(/[[:space:]]*$/, "", value)
+				print value
+				exit
+			}
+		}
+	'
 }

@@ -19,16 +19,22 @@
 
 #include "common/platform.h"
 
-#include <condition_variable>
+#include "common/type_defs.h"
+
 #include <mutex>
 #include <string>
 
+struct PidPathEntry {
+	pid_t pid;
+	std::string path;
+	bool operator<(const PidPathEntry &other) const { return pid < other.pid; }
+};
+
 struct InodePathInfo {
-    std::string pathByInode;
-    inode_t inode = 0; 
-    std::mutex mtx;
-    std::condition_variable cv;
-    bool locked = false;
+	// This will store for each PID for a path by inode request, how many times that path was
+	// requested This helps to manage multiple requests triggered from same PID
+	std::map<PidPathEntry, uint64_t> contextPidToPath;
+	std::mutex mtx;
 };
 
 inline InodePathInfo gInodePathInfo;

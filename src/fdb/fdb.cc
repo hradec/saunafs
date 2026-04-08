@@ -16,11 +16,17 @@
    along with SaunaFS  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "common/platform.h"
+
 #include "fdb/fdb.h"
-#include <foundationdb/fdb_c_types.h>
 
 #include <cstdint>
+#include <iterator>
 
+#include <foundationdb/fdb_c_types.h>
+
+#include "fdb/fdb_future.h"
+#include "kv/kv_utils.h"
 #include "slogger/slogger.h"
 
 namespace fdb {
@@ -68,41 +74,43 @@ fdb_error_t Transaction::setOption(FDBTransactionOption option, std::string_view
 std::optional<kv::Value> Transaction::get(const kv::Key &key, bool snapshot) {
 	if (!tr_) { return std::nullopt; }
 
-	FDBFuture *future =
-	    fdb_transaction_get(tr_.get(), key.data(), static_cast<int>(key.size()), snapshot);
+	UniqueFDBFuture future(
+	    fdb_transaction_get(tr_.get(), key.data(), static_cast<int>(key.size()), snapshot));
 
-	error_ = fdb_future_block_until_ready(future);
+	error_ = fdb_future_block_until_ready(future.get());
 
 	if (error_ != 0) {
 		safs::log_err("Transaction::get: fdb_future_block_until_ready: error: {}",
 		              fdb_get_error(error_));
 		return std::nullopt;
 	}
-	
+
 	fdb_bool_t valuePresent{};
 	const uint8_t *valueRead{};
 	int valueLength{};
 
-	error_ = fdb_future_get_value(future, &valuePresent, &valueRead, &valueLength);
+	error_ = fdb_future_get_value(future.get(), &valuePresent, &valueRead, &valueLength);
 
 	if (error_ != 0) {
 		safs::log_err("Transaction::get: fdb_future_get_value: error: {}", fdb_get_error(error_));
-		fdb_future_destroy(future);
 		return std::nullopt;
 	}
 
-	kv::Value value;
-
-	if (valuePresent != 0) {
-		value.assign(valueRead, valueRead + valueLength);
-	} else {
-		safs::log_info("Transaction::get: key not found: {}",
-		               std::string_view(reinterpret_cast<const char *>(key.data()), key.size()));
-		value.clear();
+	if (valuePresent == 0) {
+		safs::log_info("Transaction::get: key not found: {}", kv::keyToEscapedAscii(key));
 		return std::nullopt;
 	}
 
-	return value;
+	return kv::Value(valueRead, std::next(valueRead, valueLength));
+}
+
+std::unique_ptr<kv::IFuture> Transaction::getAsync(const kv::Key &key, bool snapshot) {
+	if (!tr_) { return nullptr; }
+
+	FDBFuture *future = fdb_transaction_get(tr_.get(), key.data(), static_cast<int>(key.size()),
+	                                         static_cast<fdb_bool_t>(snapshot));
+
+	return std::make_unique<FDBFutureValue>(future);
 }
 
 kv::GetRangeResult Transaction::getRange(
@@ -113,51 +121,29 @@ kv::GetRangeResult Transaction::getRange(
 
 	static constexpr int kBytesLimit = 0;
 
-	auto selectRangeCall = [&]() {
-		if (begin.isInclusive()) {
-			if (end.isInclusive()) {
-				// [ begin, end ]
-				return fdb_transaction_get_range(
-				    tr_.get(),
-				    FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(begin.getKey().data(), begin.getKey().size()),
-				    FDB_KEYSEL_FIRST_GREATER_THAN(end.getKey().data(), end.getKey().size()), limit,
-				    kBytesLimit, streamingMode, iteration, static_cast<fdb_bool_t>(snapshot),
-				    static_cast<fdb_bool_t>(reverse));
-			}
-			// [ begin, end )
-			return fdb_transaction_get_range(
-			    tr_.get(),
-			    FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(begin.getKey().data(), begin.getKey().size()),
-			    FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(end.getKey().data(), end.getKey().size()), limit,
-			    kBytesLimit, streamingMode, iteration, static_cast<fdb_bool_t>(snapshot),
-			    static_cast<fdb_bool_t>(reverse));
-		}
+	// For begin selectors: orEqual=0 means >= (inclusive), orEqual=1 means > (exclusive)
+	const fdb_bool_t beginOrEqual = begin.isInclusive() ? 0 : 1;
+	// FDB offsets are 1-based.
+	const int beginOffset = 1 + begin.getOffset();
 
-		if (end.isInclusive()) {
-			// ( begin, end ]
-			return fdb_transaction_get_range(
-			    tr_.get(),
-			    FDB_KEYSEL_FIRST_GREATER_THAN(begin.getKey().data(), begin.getKey().size()),
-			    FDB_KEYSEL_FIRST_GREATER_THAN(end.getKey().data(), end.getKey().size()), limit,
-			    kBytesLimit, streamingMode, iteration, static_cast<fdb_bool_t>(snapshot),
-			    static_cast<fdb_bool_t>(reverse));
-		}
-		// ( begin, end )
-		return fdb_transaction_get_range(
-		    tr_.get(), FDB_KEYSEL_FIRST_GREATER_THAN(begin.getKey().data(), begin.getKey().size()),
-		    FDB_KEYSEL_FIRST_GREATER_OR_EQUAL(end.getKey().data(), end.getKey().size()), limit,
-		    kBytesLimit, streamingMode, iteration, static_cast<fdb_bool_t>(snapshot),
-		    static_cast<fdb_bool_t>(reverse));
-	};
+	// For end selectors (which define an exclusive boundary in FDB):
+	// - To include end key in results: use orEqual=1
+	// - To exclude end key from results: use orEqual=0
+	const fdb_bool_t endOrEqual = end.isInclusive() ? 1 : 0;
+	// FDB offsets are 1-based.
+	const int endOffset = 1 + end.getOffset();
 
-	FDBFuture *future = selectRangeCall();
+	UniqueFDBFuture future(fdb_transaction_get_range(
+	    tr_.get(), begin.getKey().data(), static_cast<int>(begin.getKey().size()), beginOrEqual,
+	    beginOffset, end.getKey().data(), static_cast<int>(end.getKey().size()), endOrEqual,
+	    endOffset, limit, kBytesLimit, streamingMode, iteration, static_cast<fdb_bool_t>(snapshot),
+	    static_cast<fdb_bool_t>(reverse)));
 
-	auto error = fdb_future_block_until_ready(future);
+	auto error = fdb_future_block_until_ready(future.get());
 
 	if (error != 0) {
 		safs::log_err("Transaction::getRange: fdb_future_block_until_ready: error: {}",
 		              fdb_get_error(error));
-		fdb_future_destroy(future);
 		return {{}, false};
 	}
 
@@ -165,12 +151,11 @@ kv::GetRangeResult Transaction::getRange(
 	int count = 0;
 	fdb_bool_t more = 0;
 
-	error = fdb_future_get_keyvalue_array(future, &keyValues, &count, &more);
+	error = fdb_future_get_keyvalue_array(future.get(), &keyValues, &count, &more);
 
 	if (error != 0) {
 		safs::log_err("Transaction::getRange: fdb_future_get_keyvalue_array: error: {}",
 		              fdb_get_error(error));
-		fdb_future_destroy(future);
 		return {{}, false};
 	}
 
@@ -183,12 +168,9 @@ kv::GetRangeResult Transaction::getRange(
 		pairs.emplace_back(std::move(key), std::move(value));
 	}
 
-	fdb_future_destroy(future);
-
 	if (pairs.empty()) {
 		safs::log_info("Transaction::getRange: no keys found in range: {} - {}",
-		               std::string(begin.getKey().begin(), begin.getKey().end()),
-		               std::string(end.getKey().begin(), end.getKey().end()));
+		               kv::keyToEscapedAscii(begin.getKey()), kv::keyToEscapedAscii(end.getKey()));
 		return {{}, false};
 	}
 
@@ -204,26 +186,61 @@ void Transaction::set(const kv::Key &key, const kv::Value &value) {
 	                    static_cast<int>(value.size()));
 }
 
+void Transaction::atomicAdd(const kv::Key &key, const kv::Value &delta) {
+	if (!tr_) { return; }
+
+	fdb_transaction_atomic_op(tr_.get(), key.data(), static_cast<int>(key.size()), delta.data(),
+	                          static_cast<int>(delta.size()), FDB_MUTATION_TYPE_ADD);
+}
+
 void Transaction::remove(const kv::Key &key) {
 	if (!tr_) { return; }
 
 	fdb_transaction_clear(tr_.get(), key.data(), static_cast<int>(key.size()));
 }
 
+void Transaction::removeRange(const kv::Key &start, const kv::Key &end) {
+	if (!tr_) { return; }
+
+	fdb_transaction_clear_range(tr_.get(), start.data(), static_cast<int>(start.size()), end.data(),
+	                            static_cast<int>(end.size()));
+}
+
 bool Transaction::commit() {
 	if (!tr_) { return false; }
 
-	FDBFuture *future = fdb_transaction_commit(tr_.get());
+	UniqueFDBFuture future(fdb_transaction_commit(tr_.get()));
 
-	error_ = fdb_future_block_until_ready(future);
+	error_ = fdb_future_block_until_ready(future.get());
 
 	if (error_ != 0) {
-		safs::log_err("Transaction::commit: error: {}", fdb_get_error(error_));
-		fdb_future_destroy(future);
+		safs::log_err("Transaction::commit: fdb_future_block_until_ready: error: {}",
+		              fdb_get_error(error_));
 		return false;
 	}
 
-	fdb_future_destroy(future);
+	// fdb_future_block_until_ready() only signals the future is ready; the
+	// actual commit outcome (e.g. conflict, transaction_too_old) is in the
+	// future itself and must be checked with fdb_future_get_error().
+	error_ = fdb_future_get_error(future.get());
+
+	if (error_ != 0) {
+		safs::log_err("Transaction::commit: commit failed: {}", fdb_get_error(error_));
+		return false;
+	}
+
+	int64_t version{};
+	fdb_error_t versionError = fdb_transaction_get_committed_version(tr_.get(), &version);
+
+	if (versionError != 0) {
+		safs::log_err("Transaction::commit: fdb_transaction_get_committed_version: error: {}",
+		              fdb_get_error(versionError));
+		error_ = versionError;
+		return false;
+	}
+
+	committedVersion_ = version;
+
 	return true;
 }
 

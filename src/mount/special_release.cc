@@ -97,11 +97,14 @@ static void release(FileInfo *fi) {
 namespace InodePathByInode {
 static void release(FileInfo *fi) {
 	std::unique_lock<std::mutex> lock(gInodePathInfo.mtx);
-	fi->fh = 0;
-	if (gInodePathInfo.locked) {
-		gInodePathInfo.locked = false;
-		gInodePathInfo.cv.notify_one();
+	auto entry = reinterpret_cast<PidPathEntry *>(fi->fh);
+	if (entry) {
+		auto it = gInodePathInfo.contextPidToPath.find(*entry);
+		if (it != gInodePathInfo.contextPidToPath.end() && --(it->second) <= 0) {
+			gInodePathInfo.contextPidToPath.erase(it);
+		}
 	}
+	fi->fh = 0;
 	oplog_printf("release (%" PRIiNode ") (internal node: PATH_BY_INODE_FILE): OK", inode_);
 }
 } // InodePathByInode

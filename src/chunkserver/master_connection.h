@@ -28,11 +28,13 @@
 #include <memory>
 #include <string>
 
+#include "common/chunk_part_type.h"
+#include "common/input_packet.h"
 #include "common/network_address.h"
 #include "common/output_packet.h"
 #include "common/saunafs_version.h"
 #include "common/time_utils.h"
-#include "protocol/input_packet.h"
+#include "common/tls_session.h"
 
 static constexpr uint32_t kMaxPacketSize = 10000;
 static constexpr uint32_t kMaxBackgroundJobsCount = 1000;
@@ -43,14 +45,15 @@ inline std::string gLabel;
 inline uint32_t gTimeout_ms;
 
 // Forward declaration
-class JobPool;
+class MasterJobPool;
 
 /// @brief Enum representing the connection mode to the Metadata Server (MDS).
 enum class ConnectionMode : std::uint8_t {
 	FREE,        /// There is no socket for the connection yet.
 	CONNECTING,  /// Connection is being established.
 	CONNECTED,   /// Connection is active.
-	KILL         /// Connection has been dropped, a reconnection will be attempted.
+	KILL,        /// Connection has been dropped, a reconnection will be attempted.
+	HANDSHAKE    /// TLS handshake is in progress.
 };
 
 /// @brief Enum representing the registration status of a connection to the Metadata Server (MDS).
@@ -67,8 +70,8 @@ enum class RegistrationStatus : std::uint8_t {
 class MasterConn {
 public:
 	explicit MasterConn(const std::string &masterHostStr, const std::string &masterPortStr,
-	                    const std::string &clusterId, const std::shared_ptr<JobPool> &jobPool,
-	                    const std::shared_ptr<JobPool> &replicationJobPool)
+	                    const std::string &clusterId, const std::shared_ptr<MasterJobPool> &jobPool,
+	                    const std::shared_ptr<MasterJobPool> &replicationJobPool)
 	    : masterHostStr_(masterHostStr),
 	      masterPortStr_(masterPortStr),
 	      clusterId_(clusterId),
@@ -116,11 +119,13 @@ public:
 
 	void connectTest();
 
+	void tlsHandshake();
+
 	void onConnected();
 
 	// Polling
 
-	void providePollDescriptors(std::vector<pollfd> &pdesc);
+	void providePollDescriptors(std::vector<pollfd> &pdesc, bool doTerminate);
 
 	void handlePollErrors(const std::vector<pollfd> &pdesc);
 
@@ -136,11 +141,21 @@ public:
 
 	void createChunk(const std::vector<uint8_t> &data);
 
+	void createAndLockChunk(const std::vector<uint8_t> &data);
+
 	void deleteChunk(const std::vector<uint8_t> &data);
 
 	void setChunkVersion(const std::vector<uint8_t> &data);
 
+	void setChunkVersionAndLock(const std::vector<uint8_t> &data);
+
+	void lockChunk(const std::vector<uint8_t> &data);
+
+	void unlockChunk(const std::vector<uint8_t> &data);
+
 	void duplicateChunk(const std::vector<uint8_t> &data);
+
+	void duplicateAndLockChunk(const std::vector<uint8_t> &data);
 
 	void truncateChunk(const std::vector<uint8_t> &data);
 
@@ -151,6 +166,9 @@ public:
 	// Callbacks
 
 	static std::function<void(uint8_t status, void *packet)> sauJobFinished(MasterConn *masterConn);
+
+	static std::function<void(uint8_t status, void *packet)> sauJobFinishedAndLock(
+	    MasterConn *masterConn, uint64_t chunkId, ChunkPartType chunkType);
 
 	void sauJobFinished(uint8_t status, void *packet);
 
@@ -204,13 +222,18 @@ public:
 
 	const std::string &clusterId() const { return clusterId_; }
 
+	bool isTlsEnabled() const { return !tlsCertFile_.empty() && !tlsKeyFile_.empty(); }
+
+	bool isOutputQueueEmpty() const { return outputPackets_.empty(); }
+
 private:
 	std::string masterHostStr_;                     ///< Hostname of the master server.
 	std::string masterPortStr_;                     ///< Port of the master server.
 	uint32_t version_{saunafsVersion(0, 0, 0)};     ///< Version of the master server.
 	std::string clusterId_;                         ///< Cluster ID for this connection.
-	std::shared_ptr<JobPool> jobPool_;              ///< Shared reference to the JobPool.
-	std::shared_ptr<JobPool> replicationJobPool_;   ///< Shared reference to the ReplicationJobPool.
+	std::shared_ptr<MasterJobPool> jobPool_;        ///< Shared reference to the JobPool.
+	/// Shared reference to the ReplicationJobPool.
+	std::shared_ptr<MasterJobPool> replicationJobPool_;
 
 	// For compatibility with old masters (version < 5.0)
 	void handleRegistrationAttempt();
@@ -235,4 +258,10 @@ private:
 	// Statistics
 	uint64_t bytesIn_ = 0;   ///< Number of bytes read from the master.
 	uint64_t bytesOut_ = 0;  ///< Number of bytes sent to the master.
+
+	std::unique_ptr<TlsSession> tlsSession_{nullptr};  ///< Context of the TLS channel used for communication with master.
+	std::string tlsCertFile_;                          ///< Path to the TLS certificate file.
+	std::string tlsKeyFile_;                           ///< Path to the TLS private key file.
+	std::string tlsCaCertFile_;                        ///< Path to the TLS CA certificate file.
+	int lastHandshakeError_{0};                        ///< Last error code from TLS handshake.
 };

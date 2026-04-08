@@ -81,6 +81,10 @@ Authenticate to SaunaFS master with 'PASSWORD'.
 Authenticate to SaunaFS master using directly given 'MD5' (only if
 *sfspassword* option is not specified).
 
+*-o tlsconfigfile=*'PATH'::
+Path to the TLS configuration file for client-side TLS settings.
+(there is no default value).
+
 *-o sfsdelayedinit*::
 Connection with master is done in background - with this option mount can be
 run without network (good for being run from fstab / init scripts etc.).
@@ -130,7 +134,7 @@ Set timeout for executing each wave of a write operation in milliseconds (defaul
 Specify what part of the write cache non occupied by other inodes can a single
 inode occupy (measured in %). E.g. When N=75 and the inode X uses 10 MiB, and
 all other inodes use 20 MiB out of 100 MiB cache, X can use 50 MiB more (since
-75% of 80 MiB is 60 MiB). Default: 25.
+75% of 80 MiB is 60 MiB). Default: 100.
 
 *-o sfschunkserverreadto=*'MSEC'::
 Set timeout for whole communication with a chunkserver during read operation in
@@ -195,7 +199,7 @@ Define write window size (in blocks) for each chunk (default: 15).
 Try to lock memory (must be enabled at build time).
 
 *-o sfsdonotrememberpassword*::
-So not remember password in memory - more secure, but when session is lost then
+Do not remember password in memory - more secure, but when session is lost then
 new session is created without password.
 
 *-o sfsioretries=*'N'::
@@ -220,15 +224,9 @@ Equivalent to *--nostdopts* (*-n*) option for use in fstab.
 *-o nonempty*::
 Equivalent to *--nonempty* option for use in fstab.
 
-*-o sfsuseinodebasedwritealgorithm=*'0|1'::
-Use inode based write algorithm when set to 1. Use chunk based write algorithm
-when set to 0. Though chunk based algorithm is faster in most cases, inode
-based algorithm may prove useful in some scenarios (default: 0).
-
-*-o sfsignoreflush=*'0|1'::
-Advanced: use with caution. Ignore flush usual behavior by replying SUCCESS to
-it immediately. Targets fast creation of small files, but may cause data loss
-during crashes when allegedly flushed data is still being processed (default: 0).
+*-o sfsmaxchunkswritteninparallelperinode=*'N'::
+Define the maximum number of chunks that can be written in parallel per inode.
+0 stands for unlimited (default: 0).
 
 *-o sfsdirectio=*'0|1'::
 Whether to use FUSE DirectIO. This may improve performance when reading large
@@ -347,7 +345,7 @@ You can define your `/etc/fstab` SaunaFS share like this:
 
 == REPORTING BUGS
 
-Report bugs to the Github repository <https://github.com/leil/saunafs> as an
+Report bugs to the GitHub repository <https://github.com/leil-io/saunafs> as an
 issue.
 
 == NOTES
@@ -365,8 +363,11 @@ There is a bug with this though. See BUGS for more details.
 Due to a limit in the protocol, the metadata mount point can at most return the
 first 1 million trash/reserved files. To see more, you will need to either
 delete or undelete the existing files. Older versions of master (4.9.0 or
-earlier) will crash when reading a lot of files in trash/reserved. After around
-1 million files in trash/reserved, it becomes unsafe to read trash.
+earlier) will crash when reading a lot of files in trash/reserved. After more
+than 1 million files in trash/reserved, it becomes unsafe to read trash on
+those versions.
+
+This limit was fixed and removed in master and sfsmount version 5.3.0.
 
 == COPYRIGHT
 

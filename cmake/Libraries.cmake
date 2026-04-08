@@ -43,8 +43,9 @@ if(ENABLE_JEMALLOC)
 endif()
 
 # Find extra binaries
-find_program(A2X_BINARY a2x)
-message(STATUS "a2x: ${A2X_BINARY}")
+if(NOT WIN32)
+  include(FindAsciidoctor)
+endif()
 
 # Find Zlib
 find_package(ZLIB)
@@ -69,7 +70,7 @@ else()
 endif()
 
 # Find Boost
-find_package(Boost CONFIG REQUIRED COMPONENTS filesystem iostreams program_options system)
+find_package(Boost CONFIG REQUIRED COMPONENTS filesystem iostreams program_options)
 
 # Find Thrift
 find_package(Thrift COMPONENTS library)
@@ -156,10 +157,12 @@ message(STATUS "ISAL PIC LIBRARY: ${ISAL_PIC_LIBRARY}")
 
 # Download nfs-ganesha
 if(ENABLE_NFS_GANESHA)
-  download_external(NFS_GANESHA "nfs-ganesha-4.3"
-                    "https://github.com/nfs-ganesha/nfs-ganesha/archive/V4.3.zip")
-  download_external(NTIRPC "ntirpc-4.3"
-                    "https://github.com/nfs-ganesha/ntirpc/archive/v4.3.zip")
+  set(NFS_GANESHA_VERSION "9.2")
+  download_external(NFS_GANESHA "nfs-ganesha-${NFS_GANESHA_VERSION}"
+                    "https://github.com/nfs-ganesha/nfs-ganesha/archive/V${NFS_GANESHA_VERSION}.zip")
+  set(NTIRPC_VERSION "7.2")
+  download_external(NTIRPC "ntirpc-${NTIRPC_VERSION}"
+                    "https://github.com/nfs-ganesha/ntirpc/archive/v${NTIRPC_VERSION}.zip")
 endif()
 
 # Find Prometheus
@@ -169,3 +172,7 @@ if (PROMETHEUS_CPP_ENABLE_PULL)
 else()
     message(STATUS "Did not find Prometheus C++ Client Library (but not needed)")
 endif()
+
+# Find OpenSSL
+find_package(OpenSSL REQUIRED)
+message(STATUS "OpenSSL: includes=${OPENSSL_INCLUDE_DIR}, libs=${OPENSSL_LIBRARIES}")

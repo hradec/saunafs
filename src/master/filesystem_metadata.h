@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 
 #include "common/observable_property.h"
 #include "common/quota_database.h"
@@ -32,7 +33,10 @@
 #include "master/acl_storage.h"
 #include "master/filesystem_checksum_background_updater.h"
 #include "master/filesystem_node_types.h"
+#include "master/filesystem_trash_reserved_files.h"
 #include "master/filesystem_xattr.h"
+#include "master/hstring_storage.h"
+#include "master/id_generator_interface.h"
 #include "master/id_pool_detainer.h"
 #include "master/locks.h"
 #include "master/task_manager.h"
@@ -55,17 +59,21 @@ public:
 	// TODO(Guillex): Check implications of using 64 bits for inode_t in this structure.
 	IdPoolDetainer<inode_t, uint32_t> inodePool;
 	AclStorage aclStorage;
+	TrashReservedToIdContainer trashReservedToId;
 	TrashPathContainer trash;
+	HandleIndexContainer trashHandlesIndex;
 	ReservedPathContainer reserved;
+	HandleIndexContainer reservedHandlesIndex;
 	FSNodeDirectory *root{};
 	std::array<FSNodePointerVector, NODEHASHSIZE> nodeHash;
-	Signal<FSNode *> nodeChangedSignal;  ///< Signal emitted when a node changes
 	TaskManager taskManager;
 	FileLocks flockLocks;
 	FileLocks posixLocks;
 
-	inode_t nodes{};
 	uint64_t metadataVersion{};
+
+	// FS level statistics
+	inode_t nodes{};
 	uint64_t trashSpace{};
 	uint64_t reservedSpace{};
 	inode_t trashNodes{};
@@ -79,6 +87,20 @@ public:
 	uint64_t fsNodesChecksum{};
 	uint64_t xattrChecksum{};
 	uint64_t quotaChecksum{quotaDatabase.checksum()};
+
+	// Signals
+
+	/// Signal emitted when a node changes (added, modified, but not removed)
+	Signal<FSNode *> nodeChangedSignal;
+
+	/// Signal emitted when a node is removed
+	Signal<inode_t> nodeRemovedSignal;
+
+	/// Signal emitted when an edge changes (added, modified, but not removed)
+	Signal<FSNodeDirectory *, FSNode *, hstorage::Handle *> edgeChangedSignal;
+
+	/// Signal emitted when an edge is removed
+	Signal<inode_t, const HString &> edgeRemovedSignal;
 
 	FilesystemMetadata()
 	    : inodePool{SFS_INODE_REUSE_DELAY,
@@ -137,6 +159,8 @@ extern ChecksumBackgroundUpdater gChecksumBackgroundUpdater;
 extern bool gDisableChecksumVerification;
 extern uint32_t gTestStartTime;
 extern bool gDisableEmptyFoldersMetadataOnFullDisk;
+
+inline std::unique_ptr<IIdGenerator<inode_t>> gInodeIdGenerator = nullptr;
 
 #ifndef METARESTORE
 extern std::map<int, Goal> gGoalDefinitions;

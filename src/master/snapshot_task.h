@@ -28,6 +28,8 @@
 #include "master/hstring.h"
 #include "master/task_manager.h"
 
+class FilesystemOperationContext;
+
 /*! \brief Implementation of Snapshot Task to work with Task Manager.
  *
  * This class uses new approach to executing snapshots.
@@ -85,25 +87,29 @@ public:
 
 protected:
 	/*! \brief Test if node can be cloned. */
-	int cloneNodeTest(FSNode *src_node, FSNode *dst_node, FSNodeDirectory *dst_parent);
-	FSNode *cloneToExistingNode(uint32_t ts, FSNode *src_node, FSNodeDirectory *dst_parent,
-				    FSNode *dst_node);
-	FSNode *cloneToNewNode(uint32_t ts, FSNode *src_node, FSNodeDirectory *dst_parent);
-	FSNodeFile *cloneToExistingFileNode(uint32_t ts, FSNodeFile *src_node,
-	                                    FSNodeDirectory *dst_parent, FSNodeFile *dst_node);
-	void cloneChunkData(const FSNodeFile *src_node, FSNodeFile *dst_node,
-	                    FSNodeDirectory *dst_parent);
+	int cloneNodeTest(const FilesystemOperationContext &fsOpContext, FSNode *src_node,
+	                  FSNode *dst_node, FSNodeDirectory *dst_parent);
+	FSNode *cloneToExistingNode(const FilesystemOperationContext &fsOpContext, uint32_t ts,
+	                            FSNode *src_node, FSNodeDirectory *dst_parent, FSNode *dst_node);
+	FSNode *cloneToNewNode(const FilesystemOperationContext &fsOpContext, uint32_t ts,
+	                       FSNode *src_node, FSNodeDirectory *dst_parent);
+	FSNodeFile *cloneToExistingFileNode(const FilesystemOperationContext &fsOpContext, uint32_t ts,
+	                                    FSNodeFile *src_node, FSNodeDirectory *dst_parent,
+	                                    FSNodeFile *dst_node);
+	void cloneChunkData(const FilesystemOperationContext &fsOpContext, const FSNodeFile *src_node,
+	                    FSNodeFile *dst_node, FSNodeDirectory *dst_parent);
 	void cloneDirectoryData(const FSNodeDirectory *src_node, FSNodeDirectory *dst_node);
 	void cloneDirectoryData(FSNodeDirectory *src_node, FSNodeDirectory *dst_node);
-	void cloneSymlinkData(FSNodeSymlink *src_node, FSNodeSymlink *dst_node,
-	                      FSNodeDirectory *dst_parent);
+	void cloneSymlinkData(const FilesystemOperationContext &fsOpContext, FSNodeSymlink *src_node,
+	                      FSNodeSymlink *dst_node, FSNodeDirectory *dst_parent);
 
 	/*! \brief Emit metadata changelog.
 	 *
 	 * The function (for master) emits metadata CLONE information. For shadow it updates
 	 * metadata version.
 	 */
-	void emitChangelog(uint32_t ts, inode_t dst_inode);
+	void emitChangelog(const FilesystemOperationContext &fsOpContext, uint32_t ts,
+	                   inode_t dst_inode);
 
 private:
 	SubtaskContainer subtask_; /*!< List of pairs (inode to be cloned, clone file name). */

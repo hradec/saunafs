@@ -1,6 +1,9 @@
 configure_file(sfsmaster.cfg.in sfsmaster.cfg)
 configure_file(sfschunkserver.cfg.in sfschunkserver.cfg)
 configure_file(sfsmetalogger.cfg.in sfsmetalogger.cfg)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/sfsmds.cfg.in)
+  configure_file(sfsmds.cfg.in sfsmds.cfg)
+endif()
 configure_file(postinst.in postinst)
 set(POSTINST_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/postinst PARENT_SCOPE)
 
@@ -8,16 +11,20 @@ install(FILES metadata.sfs                                   DESTINATION ${DATA_
 install(FILES sfsexports.cfg                                 DESTINATION ${SFSMASTER_EXAMPLES_SUBDIR})
 install(FILES sfsgoals.cfg                                   DESTINATION ${SFSMASTER_EXAMPLES_SUBDIR})
 install(FILES sfshdd.cfg                                     DESTINATION ${CHUNKSERVER_EXAMPLES_SUBDIR})
-install(FILES sfsmount.cfg                                   DESTINATION ${CLIENT_EXAMPLES_SUBDIR})
-install(FILES sfsiolimits.cfg                                   DESTINATION ${CLIENT_EXAMPLES_SUBDIR})
+install(FILES sfsmount.cfg                                   DESTINATION ${CLIENT_EXAMPLES_SUBDIR} COMPONENT client)
+install(FILES sfsiolimits.cfg                                DESTINATION ${CLIENT_EXAMPLES_SUBDIR} COMPONENT client)
+install(FILES sfstls.cfg                                     DESTINATION ${CLIENT_EXAMPLES_SUBDIR} COMPONENT client)
 install(FILES sfstopology.cfg                                DESTINATION ${SFSMASTER_EXAMPLES_SUBDIR})
 install(FILES sfsglobaliolimits.cfg                             DESTINATION ${SFSMASTER_EXAMPLES_SUBDIR})
 install(FILES saunafs-uraft.cfg                             DESTINATION ${URAFT_EXAMPLES_SUBDIR})
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/sfsmaster.cfg      DESTINATION ${SFSMASTER_EXAMPLES_SUBDIR})
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/sfschunkserver.cfg DESTINATION ${CHUNKSERVER_EXAMPLES_SUBDIR})
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/sfsmetalogger.cfg  DESTINATION ${METALOGGER_EXAMPLES_SUBDIR})
+if(EXISTS ${CMAKE_CURRENT_BINARY_DIR}/sfsmds.cfg)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/sfsmds.cfg       DESTINATION ${SFSMDS_EXAMPLES_SUBDIR})
+endif()
 
-install(FILES saunafs.completion DESTINATION etc/bash_completion.d RENAME saunafs)
+install(FILES saunafs.completion DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/bash_completion.d RENAME saunafs COMPONENT client)
 
 if(BUILD_TESTS)
   # Create a mock include dir.

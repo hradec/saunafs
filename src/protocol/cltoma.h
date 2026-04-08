@@ -23,6 +23,7 @@
 #include "common/platform.h"
 
 #include <array>
+#include <cstdint>
 
 #include "common/access_control_list.h"
 #include "common/acl_type.h"
@@ -37,12 +38,11 @@
 #include "protocol/packet.h"
 #include "protocol/quota.h"
 
-namespace cltoma { namespace updateCredentials {
-enum DefaultGroupsSize {
-	kDefaultGroupsSize = 16
-};
-typedef small_vector<uint32_t, kDefaultGroupsSize> GroupsContainer;
-} } // cltoma::updateCredentials
+namespace cltoma::updateCredentials {
+constexpr uint32_t kDefaultGroupsSize = 16;
+using GroupsContainer = small_vector<uint32_t, kDefaultGroupsSize>;
+}  // namespace cltoma::updateCredentials
+
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, updateCredentials, SAU_CLTOMA_UPDATE_CREDENTIALS, 0,
 		uint32_t, messageId,
 		uint32_t, index,
@@ -165,6 +165,10 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, metadataserversList, SAU_CLTOMA_METADATASERVERS_LIST, 0)
 
+// SAU_CLTOMA_INOTIFIER_LIST
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(
+		cltoma, inotifierList, SAU_CLTOMA_INOTIFIER_LIST, 0)
+
 // SAU_CLTOMA_FUSE_GETGOAL
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, fuseGetGoal, SAU_CLTOMA_FUSE_GETGOAL, 0,
@@ -224,7 +228,8 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, adminRegister, SAU_CLTOMA_ADMIN_REGISTER_CHALLENGE, 0)
 
 // SAU_CLTOMA_ADMIN_REGISTER_RESPONSE
-typedef std::array<uint8_t, 16> SauCltomaAdminRegisterResponseData;
+constexpr size_t kAdminRegisterResponseDataSize = 16;
+using SauCltomaAdminRegisterResponseData = std::array<uint8_t, kAdminRegisterResponseDataSize>;
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, adminRegisterResponse, SAU_CLTOMA_ADMIN_REGISTER_RESPONSE, 0,
 		SauCltomaAdminRegisterResponseData, data)
@@ -310,7 +315,7 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 SAUNAFS_DEFINE_PACKET_VERSION(cltoma, manageLocksList, kAll, 0)
 SAUNAFS_DEFINE_PACKET_VERSION(cltoma, manageLocksList, kInode, 1)
 
-#define SAU_CLTOMA_MANAGE_LOCKS_LIST_LIMIT 1024
+constexpr uint64_t SAU_CLTOMA_MANAGE_LOCKS_LIST_LIMIT = 1024;
 
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, manageLocksList, SAU_CLTOMA_MANAGE_LOCKS_LIST, kAll,
@@ -380,15 +385,10 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		uint32_t, uid,
 		uint32_t, gid)
 
+// Not used: just kept to document the historical version numbering
 SAUNAFS_DEFINE_PACKET_VERSION(cltoma, fuseGetDirLegacy, kLegacyClient, 0)
 SAUNAFS_DEFINE_PACKET_VERSION(cltoma, fuseGetDir, kClientAbleToProcessDirentIndex, 1)
-SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetDirLegacy, SAU_CLTOMA_FUSE_GETDIR, kLegacyClient,
-		uint32_t, message_id,
-		inode_t, inode,
-		uint32_t, uid,
-		uint32_t, gid,
-		uint64_t, first_entry,
-		uint64_t, number_of_entries)
+
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetDir, SAU_CLTOMA_FUSE_GETDIR, kClientAbleToProcessDirentIndex,
 		uint32_t, message_id,
 		inode_t, inode,
@@ -397,15 +397,27 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetDir, SAU_CLTOMA_FUSE_GETDIR, 
 		uint64_t, first_entry,
 		uint64_t, number_of_entries)
 
-SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetReserved, SAU_CLTOMA_FUSE_GETRESERVED, 0,
+SAUNAFS_DEFINE_PACKET_VERSION(cltoma, fuseGetReserved, kClientPositionOffset, 0)
+SAUNAFS_DEFINE_PACKET_VERSION(cltoma, fuseGetReserved, kClientHandleOffset, 1)
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetReserved, SAU_CLTOMA_FUSE_GETRESERVED, kClientPositionOffset,
 		uint32_t, msgid,
 		uint32_t, off,
 		uint32_t, max_entries)
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetReserved, SAU_CLTOMA_FUSE_GETRESERVED, kClientHandleOffset,
+		uint32_t, msgid,
+		uint64_t, handleOffset,
+		uint32_t, maxEntries)
 
-SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetTrash, SAU_CLTOMA_FUSE_GETTRASH, 0,
+SAUNAFS_DEFINE_PACKET_VERSION(cltoma, fuseGetTrash, kClientPositionOffset, 0)
+SAUNAFS_DEFINE_PACKET_VERSION(cltoma, fuseGetTrash, kClientHandleOffset, 1)
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetTrash, SAU_CLTOMA_FUSE_GETTRASH, kClientPositionOffset,
 		uint32_t, msgid,
 		uint32_t, off,
 		uint32_t, max_entries)
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, fuseGetTrash, SAU_CLTOMA_FUSE_GETTRASH, kClientHandleOffset,
+		uint32_t, msgid,
+		uint64_t, handleOffset,
+		uint32_t, maxEntries)
 
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, listTasks, SAU_CLTOMA_LIST_TASKS, 0,
@@ -456,6 +468,10 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		cltoma, mountInfoList, SAU_CLTOMA_MOUNT_INFO_LIST, 0)
+
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, startTls, SAU_CLTOMA_STARTTLS, 0)
+
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(cltoma, endTls, SAU_CLTOMA_ENDTLS, 0)
 
 namespace cltoma {
 

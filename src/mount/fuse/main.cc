@@ -254,6 +254,8 @@ static int mainloop(struct fuse_args *args, struct fuse_cmdline_opts *fuse_opts,
 	params.keep_cache = gMountOptions.keepcache;
 	params.direntry_cache_timeout = gMountOptions.direntrycacheto;
 	params.direntry_cache_size = gMountOptions.direntrycachesize;
+	params.negative_cache_timeout = gMountOptions.negativecachetimeout;
+	params.negative_cache_size = gMountOptions.negativecachesize;
 	params.entry_cache_timeout = gMountOptions.entrycacheto;
 	params.attr_cache_timeout = gMountOptions.attrcacheto;
 	params.mkdir_copy_sgid = gMountOptions.mkdircopysgid;
@@ -263,9 +265,8 @@ static int mainloop(struct fuse_args *args, struct fuse_cmdline_opts *fuse_opts,
 	params.acl_cache_size = gMountOptions.aclcachesize;
 	params.debug_mode = gMountOptions.debug;
 	params.direct_io = gMountOptions.directio;
-	params.use_inode_based_write_algorithm =
-	    gMountOptions.useinodebasedwritealgorithm;
-	params.ignore_flush = gMountOptions.ignoreflush;
+	params.max_chunks_written_in_parallel_per_inode =
+	    gMountOptions.maxchunkswritteninparallelperinode;
 	params.malloc_trim_period = gMountOptions.malloctrimperiod;
 	params.log_notifications_area = gMountOptions.lognotificationarea;
 	params.message_suppression_period = gMountOptions.messagesuppressionperiod;
@@ -273,6 +274,7 @@ static int mainloop(struct fuse_args *args, struct fuse_cmdline_opts *fuse_opts,
 	params.use_quota_in_volume_size = gMountOptions.usequotainvolumesize;
 	params.max_wait_retry_time = gMountOptions.maxwaitretrytime;
 	params.mastercomm_sleep_time_divisor = gMountOptions.mastercommsleeptimedivisor;
+	params.tls_config_file = gMountOptions.tlsconfigfile;
 
 	if (!gMountOptions.meta) {
 		SaunaClient::fs_init(params);
@@ -639,6 +641,18 @@ int main(int argc, char *argv[]) try {
 	if (!gMountOptions.writecachesize)
 		gMountOptions.writecachesize = 128;
 
+	if (gMountOptions.ignoreflush) {
+		std::fprintf(stderr,
+		             "Warning: option 'sfsignoreflush' is deprecated and has no "
+		             "effect; it will be ignored.\n");
+	}
+
+	if (gMountOptions.useinodebasedwritealgorithm) {
+		fprintf(stderr,
+		        "Warning: option 'sfsuseinodebasedwritealgorithm' is deprecated and has no "
+		        "effect; it will be ignored.\n");
+	}
+
 	if (gMountOptions.cachePerInodePercentage < 1) {
 		fprintf(stderr, "cache per inode percentage too low (%u %%) - "
 				"increased to 1%%\n",
@@ -698,6 +712,11 @@ int main(int argc, char *argv[]) try {
 				"decreased to 10000000\n",
 		        gMountOptions.direntrycachesize);
 		gMountOptions.direntrycachesize = 10000000;
+	}
+
+	if (!gMountOptions.tlsconfigfile) {
+		gMountOptions.tlsconfigfile =
+		    strdup(SaunaClient::FsInitParams::kDefaultTlsConfigFile.data());
 	}
 
 	gLimitGlibcArenas = gMountOptions.limitglibcmallocarenas;
@@ -777,6 +796,7 @@ int main(int argc, char *argv[]) try {
 		free(gMountOptions.iolimits);
 	if (gDefaultMountpoint && gDefaultMountpoint != fuse_opts.mountpoint)
 		free(gDefaultMountpoint);
+	free(gMountOptions.tlsconfigfile);
 	free(fuse_opts.mountpoint);
 	free(conn_opts);
 	stats_term();

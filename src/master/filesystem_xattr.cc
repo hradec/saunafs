@@ -26,6 +26,13 @@
 #include <master/filesystem_metadata.h>
 #include <master/filesystem_xattr.h>
 
+XAttributeInodeEntry *find_xattr_inode_entry(inode_t inode, uint32_t inodeHash) {
+	for (const auto &xattrEntry : gMetadata->xattrInodeHash[inodeHash]) {
+		if (xattrEntry->inode == inode) { return xattrEntry.get(); }
+	}
+	return nullptr;
+}
+
 static uint64_t xattr_checksum(const XAttributeDataEntry *xattrDataEntry) {
 	if (!xattrDataEntry) {
 		return 0;
@@ -115,21 +122,25 @@ void xattr_recalculate_checksum() {
 
 void xattr_removeinode(inode_t inode) {
 	XAttributeInodeEntry *xattrInodeEntry = nullptr;
+	bool hadEntries = false;
 
 	auto hash = get_xattr_inode_hash(inode);
-	auto start = gMetadata->xattrInodeHash[hash].begin();
-	auto end = gMetadata->xattrInodeHash[hash].end();
-
-	for (auto attributeIterator = start; attributeIterator != end;) {
+	auto &bucket = gMetadata->xattrInodeHash[hash];
+	for (auto attributeIterator = bucket.begin(); attributeIterator != bucket.end();) {
 		xattrInodeEntry = attributeIterator->get();
 		if (xattrInodeEntry->inode == inode) {
+			hadEntries = true;
 			while (!xattrInodeEntry->xattrDataEntries.empty()) {
 				xattr_removeentry(xattrInodeEntry, xattrInodeEntry->xattrDataEntries.front());
 			}
-			attributeIterator = gMetadata->xattrInodeHash[hash].erase(attributeIterator);
+			attributeIterator = bucket.erase(attributeIterator);
 		} else {
 			++attributeIterator;
 		}
+	}
+
+	if (hadEntries) {
+		gXAttrInodeRemovedSignal.emit(inode);
 	}
 }
 
@@ -149,12 +160,7 @@ uint8_t xattr_setattr(inode_t inode, uint8_t attributeNameLength, const uint8_t 
 	}
 
 	auto inodeHash = get_xattr_inode_hash(inode);
-	for (const auto &xattrEntry : gMetadata->xattrInodeHash[inodeHash]) {
-		xattrInodeEntry = xattrEntry.get();
-		if (xattrInodeEntry->inode == inode) {
-			break;
-		}
-	}
+	xattrInodeEntry = find_xattr_inode_entry(inode, inodeHash);
 
 	auto dataHash = get_xattr_data_hash(inode, attributeNameLength, attributeName);
 	for (const auto &xattrDataEntry : gMetadata->xattrDataHash[dataHash]) {
@@ -235,7 +241,7 @@ uint8_t xattr_setattr(inode_t inode, uint8_t attributeNameLength, const uint8_t 
 	gMetadata->xattrDataHash[dataHash].push_back(std::move(xattrDataEntry));
 	auto *xattrDataEntryPointer = gMetadata->xattrDataHash[dataHash].back().get();
 
-	if (xattrInodeEntry) {
+	if (xattrInodeEntry != nullptr) {
 		xattrInodeEntry->xattrDataEntries.push_back(xattrDataEntryPointer);
 		xattrInodeEntry->attributeNameLength += attributeNameLength + 1U;
 		xattrInodeEntry->attributeValueLength += attributeValueLength;

@@ -24,20 +24,25 @@
 #include "master/chunks.h"
 #include "master/filesystem_checksum.h"
 #include "master/filesystem_metadata.h"
-#include "master/filesystem_node.h"
-#include "master/filesystem_operations.h"
-#include "master/filesystem_quota.h"
+#include "master/filesystem_operation_context.h"
+#include "master/filesystem_operations_interface.h"
 
-int SnapshotTask::cloneNodeTest(FSNode *src_node, FSNode *dst_node, FSNodeDirectory *dst_parent) {
-	if (fsnodes_quota_exceeded_ug(src_node, {{QuotaResource::kInodes, 1}}) ||
-	    fsnodes_quota_exceeded_dir(dst_parent, {{QuotaResource::kInodes, 1}})) {
+int SnapshotTask::cloneNodeTest(const FilesystemOperationContext &fsOpContext, FSNode *src_node,
+                                FSNode *dst_node, FSNodeDirectory *dst_parent) {
+	if (gFSOperations->quotaExceededUg(fsOpContext, src_node->uid, src_node->gid,
+	                                   {{QuotaResource::kInodes, 1}}) ||
+	    gFSOperations->quotaExceededDir(fsOpContext, dst_parent,
+	                                    {{QuotaResource::kInodes, 1}})) {
 		return SAUNAFS_ERROR_QUOTA;
 	}
 	if (src_node->type == FSNodeType::kFile &&
-	    (fsnodes_quota_exceeded_ug(src_node, {{QuotaResource::kSize, 1}}) ||
-	     fsnodes_quota_exceeded_dir(dst_parent, {{QuotaResource::kSize, 1}}))) {
+	    (gFSOperations->quotaExceededUg(fsOpContext, src_node->uid, src_node->gid,
+	                                    {{QuotaResource::kSize, 1}}) ||
+	     gFSOperations->quotaExceededDir(fsOpContext, dst_parent,
+	                                    {{QuotaResource::kSize, 1}}))) {
 		return SAUNAFS_ERROR_QUOTA;
 	}
+
 	if (dst_node) {
 		if (orig_inode_ != 0 && dst_node->id == orig_inode_) {
 			return SAUNAFS_ERROR_EINVAL;
@@ -52,8 +57,9 @@ int SnapshotTask::cloneNodeTest(FSNode *src_node, FSNode *dst_node, FSNodeDirect
 	return SAUNAFS_STATUS_OK;
 }
 
-FSNode *SnapshotTask::cloneToExistingNode(uint32_t ts, FSNode *src_node,
-		FSNodeDirectory *dst_parent, FSNode *dst_node) {
+FSNode *SnapshotTask::cloneToExistingNode(const FilesystemOperationContext &fsOpContext,
+                                          uint32_t ts, FSNode *src_node,
+                                          FSNodeDirectory *dst_parent, FSNode *dst_node) {
 	assert(src_node->type == dst_node->type);
 
 	switch (src_node->type) {
@@ -62,11 +68,11 @@ FSNode *SnapshotTask::cloneToExistingNode(uint32_t ts, FSNode *src_node,
 		                   static_cast<FSNodeDirectory *>(dst_node));
 		break;
 	case FSNodeType::kFile:
-		dst_node = cloneToExistingFileNode(ts, static_cast<FSNodeFile *>(src_node),
+		dst_node = cloneToExistingFileNode(fsOpContext, ts, static_cast<FSNodeFile *>(src_node),
 		                                   dst_parent, static_cast<FSNodeFile *>(dst_node));
 		break;
 	case FSNodeType::kSymlink:
-		cloneSymlinkData(static_cast<FSNodeSymlink *>(src_node),
+		cloneSymlinkData(fsOpContext, static_cast<FSNodeSymlink *>(src_node),
 		                 static_cast<FSNodeSymlink *>(dst_node), dst_parent);
 		break;
 	case FSNodeType::kBlockDev:
@@ -88,10 +94,11 @@ FSNode *SnapshotTask::cloneToExistingNode(uint32_t ts, FSNode *src_node,
 	return dst_node;
 }
 
-FSNode *SnapshotTask::cloneToNewNode(uint32_t ts, FSNode *src_node, FSNodeDirectory *dst_parent) {
-	FSNode *dst_node = fsnodes_create_node(
-	        ts, dst_parent, current_subtask_->second, src_node->type, src_node->mode, 0,
-	        src_node->uid, src_node->gid, 0, AclInheritance::kDontInheritAcl, dst_inode_);
+FSNode *SnapshotTask::cloneToNewNode(const FilesystemOperationContext &fsOpContext, uint32_t ts,
+                                     FSNode *src_node, FSNodeDirectory *dst_parent) {
+	FSNode *dst_node = gFSOperations->nodeOperations()->createNode(fsOpContext,
+	    ts, dst_parent, current_subtask_->second, src_node->type, src_node->mode, 0, src_node->uid,
+	    src_node->gid, 0, AclInheritance::kDontInheritAcl, dst_inode_);
 
 	dst_node->goal = src_node->goal;
 	dst_node->trashtime = src_node->trashtime;
@@ -105,11 +112,11 @@ FSNode *SnapshotTask::cloneToNewNode(uint32_t ts, FSNode *src_node, FSNodeDirect
 		                   static_cast<FSNodeDirectory *>(dst_node));
 		break;
 	case FSNodeType::kFile:
-		cloneChunkData(static_cast<FSNodeFile *>(src_node),
+		cloneChunkData(fsOpContext, static_cast<FSNodeFile *>(src_node),
 		               static_cast<FSNodeFile *>(dst_node), dst_parent);
 		break;
 	case FSNodeType::kSymlink:
-		cloneSymlinkData(static_cast<FSNodeSymlink *>(src_node),
+		cloneSymlinkData(fsOpContext, static_cast<FSNodeSymlink *>(src_node),
 		                 static_cast<FSNodeSymlink *>(dst_node), dst_parent);
 		break;
 	case FSNodeType::kBlockDev:
@@ -124,29 +131,34 @@ FSNode *SnapshotTask::cloneToNewNode(uint32_t ts, FSNode *src_node, FSNodeDirect
 	return dst_node;
 }
 
-FSNodeFile *SnapshotTask::cloneToExistingFileNode(uint32_t ts, FSNodeFile *src_node,
-		FSNodeDirectory *dst_parent, FSNodeFile *dst_node) {
+FSNodeFile *SnapshotTask::cloneToExistingFileNode(const FilesystemOperationContext &fsOpContext,
+                                                  uint32_t ts, FSNodeFile *src_node,
+                                                  FSNodeDirectory *dst_parent,
+                                                  FSNodeFile *dst_node) {
 	bool same = dst_node->length == src_node->length && dst_node->chunks == src_node->chunks;
 
 	if (same) {
 		return dst_node;
 	}
 
-	fsnodes_unlink(ts, dst_parent, current_subtask_->second, dst_node);
-	dst_node = static_cast<FSNodeFile *>(fsnodes_create_node(
-	        ts, dst_parent, current_subtask_->second, FSNodeType::kFile, src_node->mode, 0,
-	        src_node->uid, src_node->gid, 0, AclInheritance::kDontInheritAcl, dst_inode_));
+	gFSOperations->nodeOperations()->unlink(fsOpContext, ts, dst_parent, current_subtask_->second,
+	                                        dst_node);
 
-	cloneChunkData(src_node, dst_node, dst_parent);
+	dst_node = static_cast<FSNodeFile *>(gFSOperations->nodeOperations()->createNode(
+	    fsOpContext, ts, dst_parent, current_subtask_->second, FSNodeType::kFile, src_node->mode, 0,
+	    src_node->uid, src_node->gid, 0, AclInheritance::kDontInheritAcl, dst_inode_));
+
+	cloneChunkData(fsOpContext, src_node, dst_node, dst_parent);
 
 	return dst_node;
 }
 
-void SnapshotTask::cloneChunkData(const FSNodeFile *src_node, FSNodeFile *dst_node,
-		FSNodeDirectory *dst_parent) {
+void SnapshotTask::cloneChunkData(const FilesystemOperationContext &fsOpContext,
+                                  const FSNodeFile *src_node, FSNodeFile *dst_node,
+                                  FSNodeDirectory *dst_parent) {
 	StatsRecord psr, nsr;
 
-	fsnodes_get_stats(dst_node, &psr);
+	gFSOperations->nodeOperations()->getStats(fsOpContext, dst_node, &psr);
 
 	dst_node->goal = src_node->goal;
 	dst_node->trashtime = src_node->trashtime;
@@ -164,9 +176,10 @@ void SnapshotTask::cloneChunkData(const FSNodeFile *src_node, FSNodeFile *dst_no
 		}
 	}
 
-	fsnodes_get_stats(dst_node, &nsr);
-	fsnodes_add_sub_stats(dst_parent, &nsr, &psr);
-	fsnodes_quota_update(dst_node, {{QuotaResource::kSize, nsr.size - psr.size}});
+	gFSOperations->nodeOperations()->getStats(fsOpContext, dst_node, &nsr);
+	gFSOperations->nodeOperations()->addSubStats(fsOpContext, dst_parent, &nsr, &psr);
+	gFSOperations->quotaUpdate(fsOpContext, dst_node,
+	                           {{QuotaResource::kSize, nsr.size - psr.size}});
 }
 
 void SnapshotTask::cloneDirectoryData(const FSNodeDirectory *src_node, FSNodeDirectory *dst_node) {
@@ -180,41 +193,47 @@ void SnapshotTask::cloneDirectoryData(const FSNodeDirectory *src_node, FSNodeDir
 		data.emplace_back(std::move(local_id), (HString)(*entry.first));
 	}
 	if (!data.empty()) {
-		auto task = new SnapshotTask(std::move(data), orig_inode_,
-		                                           dst_node->id, 0, can_overwrite_,
-		                                           ignore_missing_src_,
-		                                           emit_changelog_, enqueue_work_);
+		auto task = new SnapshotTask(std::move(data), orig_inode_, dst_node->id, 0, can_overwrite_,
+		                             ignore_missing_src_, emit_changelog_, enqueue_work_);
 		local_tasks_.push_back(*task);
 	}
 }
 
-void SnapshotTask::cloneSymlinkData(FSNodeSymlink *src_node, FSNodeSymlink *dst_node,
-		FSNodeDirectory *dst_parent) {
+void SnapshotTask::cloneSymlinkData(const FilesystemOperationContext &fsOpContext,
+                                    FSNodeSymlink *src_node, FSNodeSymlink *dst_node,
+                                    FSNodeDirectory *dst_parent) {
 	StatsRecord psr, nsr;
 
-	fsnodes_get_stats(dst_node, &psr);
+	gFSOperations->nodeOperations()->getStats(fsOpContext, dst_node, &psr);
 
 	dst_node->path = src_node->path;
 	dst_node->path_length = src_node->path_length;
 
-	fsnodes_get_stats(dst_node, &nsr);
-	fsnodes_add_sub_stats(dst_parent, &nsr, &psr);
+	gFSOperations->nodeOperations()->getStats(fsOpContext, dst_node, &nsr);
+	gFSOperations->nodeOperations()->addSubStats(fsOpContext, dst_parent, &nsr, &psr);
 }
 
-void SnapshotTask::emitChangelog(uint32_t ts, inode_t dst_inode) {
+void SnapshotTask::emitChangelog(const FilesystemOperationContext &fsOpContext, uint32_t ts,
+                                 inode_t dst_inode) {
 	if (!emit_changelog_) {
-		gMetadata->metadataVersion++;
+		gFSOperations->increaseMetadataVersion(fsOpContext);
 		return;
 	}
 
-	fs_changelog(ts, "CLONE(%" PRIiNode ",%" PRIiNode ",%" PRIiNode ",%s,%" PRIu8 ")",
-	             current_subtask_->first, dst_parent_inode_, dst_inode,
-	             fsnodes_escape_name(current_subtask_->second).c_str(), can_overwrite_);
+	gFSOperations->changeLog(
+	    fsOpContext, ts, "CLONE(%" PRIiNode ",%" PRIiNode ",%" PRIiNode ",%s,%" PRIu8 ")",
+	    current_subtask_->first, dst_parent_inode_, dst_inode,
+	    gFSOperations->nodeOperations()->escapeName(current_subtask_->second).c_str(),
+	    can_overwrite_);
 }
 
 int SnapshotTask::cloneNode(uint32_t ts) {
-	FSNode *src_node = fsnodes_id_to_node(current_subtask_->first);
-	FSNodeDirectory *dst_parent = fsnodes_id_to_node<FSNodeDirectory>(dst_parent_inode_);
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadWrite);
+	FSNode *src_node =
+	    gFSOperations->nodeOperations()->idToNode(fsOpContext, current_subtask_->first);
+	auto *dst_parent =
+	    gFSOperations->nodeOperations()->idToNode<FSNodeDirectory>(fsOpContext, dst_parent_inode_);
 
 	if (!src_node || src_node->type == FSNodeType::kTrash ||
 	    src_node->type == FSNodeType::kReserved) {
@@ -224,26 +243,37 @@ int SnapshotTask::cloneNode(uint32_t ts) {
 		return SAUNAFS_ERROR_EINVAL;
 	}
 
-	FSNode *dst_node = fsnodes_lookup(dst_parent, current_subtask_->second);
+	FSNode *dst_node =
+	    gFSOperations->nodeOperations()->lookup(fsOpContext, dst_parent, current_subtask_->second);
 
-	int status = cloneNodeTest(src_node, dst_node, dst_parent);
+	int status = cloneNodeTest(fsOpContext, src_node, dst_node, dst_parent);
 	if (status != SAUNAFS_STATUS_OK) {
 		return status;
 	}
 
 	if (dst_node) {
-		dst_node = cloneToExistingNode(ts, src_node, dst_parent, dst_node);
+		dst_node = cloneToExistingNode(fsOpContext, ts, src_node, dst_parent, dst_node);
 	} else {
-		dst_node = cloneToNewNode(ts, src_node, dst_parent);
+		dst_node = cloneToNewNode(fsOpContext, ts, src_node, dst_parent);
 	}
 
 	assert(dst_node);
 	fsnodes_update_checksum(dst_node);
 	fsnodes_update_checksum(dst_parent);
-	emitChangelog(ts, dst_node->id);
+	emitChangelog(fsOpContext, ts, dst_node->id);
 	if (dst_inode_ != 0 && dst_inode_ != dst_node->id) {
 		return SAUNAFS_ERROR_MISMATCH;
 	}
+
+	if (fsOpContext.hasReadWriteTransaction()) {
+		if (!fsOpContext.getReadWriteTransaction()->commit()) {
+			safs::log_err(
+			    "{}: transaction failed to commit: source inode {}, destination parent inode {}, name {}",
+			    __func__, current_subtask_->first, dst_parent_inode_, current_subtask_->second);
+			return SAUNAFS_ERROR_IO;
+		}
+	}
+
 	return SAUNAFS_STATUS_OK;
 }
 

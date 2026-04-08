@@ -22,14 +22,18 @@
 
 #include "common/platform.h"
 
+#include <cstdint>
 #include <cstdio>
+#include <memory>
 
 #include "common/chunk_part_type.h"
 #include "common/chunk_type_with_address.h"
 #include "common/chunk_with_address_and_label.h"
 #include "common/chunks_availability_state.h"
+#include "common/observable_property.h"
 #include "common/time_utils.h"
 #include "master/checksum.h"
+#include "master/id_generator_interface.h"
 #include "master/metadata_loader.h"
 
 struct matocsserventry;
@@ -38,14 +42,22 @@ extern bool gAvoidSameIpChunkservers;
 
 extern Timeout gTimeoutSinceLastChunkRegistration;
 
+inline Signal<uint64_t, uint32_t, uint32_t, uint32_t> gChunkChangedSignal;
+
+inline std::unique_ptr<IIdGeneratorWithState<uint64_t>> gChunkIdGenerator = nullptr;
+
+void chunk_add_from_initial_metadata_load(uint64_t chunkId, uint32_t chunkVersion,
+                                          uint32_t lockedTo, uint32_t lockId);
 int chunk_increase_version(uint64_t chunkid);
 int chunk_set_version(uint64_t chunkid,uint32_t version);
 int chunk_change_file(uint64_t chunkid,uint8_t prevgoal,uint8_t newgoal);
 int chunk_delete_file(uint64_t chunkid,uint8_t goal);
-int chunk_add_file(uint64_t chunkid,uint8_t goal);
+int chunk_add_file(uint64_t chunkid, uint8_t goal, bool isMetadataLoading = false);
 int chunk_unlock(uint64_t chunkid);
 uint8_t chunk_apply_modification(uint32_t ts, uint64_t oldChunkId, uint32_t lockid, uint8_t goal,
 		bool doIncreaseVersion, uint64_t *newChunkId);
+
+bool should_increase_chunk_version_on_modification(uint8_t operation);
 
 // Tries to set next chunk id to a passed value, returns status
 uint8_t chunk_set_next_chunkid(uint64_t nextChunkIdToBeSet);
@@ -53,9 +65,8 @@ uint8_t chunk_set_next_chunkid(uint64_t nextChunkIdToBeSet);
 #ifdef METARESTORE
 void chunk_dump(void);
 #else
-uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal,
-		bool usedummylockid, bool quota_exceeded, uint8_t *opflag, uint64_t *nchunkid,
-		uint32_t min_server_version);
+uint8_t chunk_multi_modify(uint64_t ochunkid, uint32_t *lockid, uint8_t goal, bool quota_exceeded,
+                           uint8_t *opflag, uint64_t *nchunkid, uint32_t min_server_version);
 uint8_t chunk_multi_truncate(uint64_t ochunkid, uint32_t lockid, uint32_t length,
 		uint8_t goal, bool denyTruncatingParityParts, bool quota_exceeded, uint64_t *nchunkid);
 void chunk_stats(uint32_t *del,uint32_t *repl);
@@ -92,6 +103,10 @@ void chunk_got_replicate_status(matocsserventry *ptr, uint64_t chunkId, uint32_t
 
 void chunk_got_create_status(matocsserventry *ptr, uint64_t chunkid, ChunkPartType chunkType, uint8_t status);
 void chunk_got_duplicate_status(matocsserventry *ptr, uint64_t chunkId, ChunkPartType chunkType, uint8_t status);
+void chunk_got_chunklock_status(matocsserventry *ptr, uint64_t chunkId, ChunkPartType chunkType,
+                                uint8_t status);
+void chunk_got_writeend_status(matocsserventry *ptr, uint64_t chunkId, ChunkPartType chunkType,
+                               uint8_t status);
 void chunk_got_setversion_status(matocsserventry *ptr, uint64_t chunkId, ChunkPartType chunkType, uint8_t status);
 void chunk_got_truncate_status(matocsserventry *ptr, uint64_t chunkId, ChunkPartType chunkType, uint8_t status);
 void chunk_got_duptrunc_status(matocsserventry *ptr, uint64_t chunkId, ChunkPartType chunkType, uint8_t status);

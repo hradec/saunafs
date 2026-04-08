@@ -8,8 +8,7 @@
         {
             "name": "default",
             "generator": "Unix Makefiles",
-            "binaryDir": "${sourceDir}/build/saunafs",
-            "installDir": "${sourceDir}/install/saunafs/",
+            "binaryDir": "${sourceDir}/build/leilfs",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "RelWithDebInfo",
                 "CODE_COVERAGE": "OFF",
@@ -40,8 +39,8 @@
         {
             "name": "windows-default",
             "generator": "MinGW Makefiles",
-            "binaryDir": "${sourceDir}/build/saunafs",
-            "installDir": "${sourceDir}/install/saunafs/",
+            "binaryDir": "${sourceDir}/build/leilfs",
+            "installDir": "${sourceDir}/install/leilfs/",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "RelWithDebInfo",
                 "CMAKE_CXX_COMPILER": "C:/msys64/mingw64/bin/g++.exe",
@@ -80,7 +79,8 @@
         },
         {
             "name": "debug",
-            "binaryDir": "${sourceDir}/build/saunafs/debug",
+            "binaryDir": "${sourceDir}/build/leilfs/debug",
+            "installDir": "${sourceDir}/install/leilfs/",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug"
             },
@@ -88,7 +88,8 @@
         },
         {
             "name": "coverage",
-            "binaryDir": "${sourceDir}/build/saunafs/coverage",
+            "binaryDir": "${sourceDir}/build/leilfs/coverage",
+            "installDir": "${sourceDir}/install/leilfs/",
             "cacheVariables": {
                 "CODE_COVERAGE": "ON"
             },
@@ -96,12 +97,14 @@
         },
         {
             "name": "test",
+            "installDir": "${sourceDir}/install/leilfs/",
             "inherits": "default"
         },
         {
             "name": "release",
-            "binaryDir": "${sourceDir}/build/saunafs/release",
+            "binaryDir": "${sourceDir}/build/leilfs/release",
             "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_INSTALL_PREFIX": "/",
                 "ENABLE_TESTS": "OFF",
                 "ENABLE_WERROR": "OFF",
@@ -125,6 +128,13 @@
         {
             "name": "test-vcpkg",
             "inherits": ["test", "vcpkg"]
+        },
+        {
+            "name": "wsl1-test-vcpkg",
+            "inherits": ["test-vcpkg"],
+            "cacheVariables": {
+                "ENABLE_FOUNDATIONDB": "OFF"
+            }
         }
     ],
     "buildPresets": [
@@ -176,6 +186,11 @@
             "name": "test-vcpkg",
             "configurePreset": "test-vcpkg",
             "inherits": ["default"]
+        },
+        {
+            "name": "wsl1-test-vcpkg",
+            "configurePreset": "wsl1-test-vcpkg",
+            "inherits": ["default"]
         }
     ],
     "workflowPresets": [
@@ -214,6 +229,10 @@
                 },
                 {
                     "type": "build",
+                    "name": "release"
+                },
+                {
+                    "type": "package",
                     "name": "release"
                 }
             ]
@@ -267,6 +286,10 @@
                 {
                     "type": "build",
                     "name": "release-vcpkg"
+                },
+                {
+                    "type": "package",
+                    "name": "release-vcpkg"
                 }
             ]
         },
@@ -295,6 +318,31 @@
                     "name": "test-vcpkg"
                 }
             ]
+        },
+        {
+            "name": "wsl1-test-vcpkg",
+            "steps": [
+                {
+                    "type": "configure",
+                    "name": "wsl1-test-vcpkg"
+                },
+                {
+                    "type": "build",
+                    "name": "wsl1-test-vcpkg"
+                }
+            ]
+        }
+    ],
+    "packagePresets": [
+        {
+            "name": "release",
+            "configurePreset": "release",
+            "generators": ["DEB"]
+        },
+        {
+            "name": "release-vcpkg",
+            "configurePreset": "release-vcpkg",
+            "generators": ["DEB"]
         }
     ]
 }

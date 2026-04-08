@@ -25,15 +25,28 @@
 #include <cstdint>
 
 #include "common/type_defs.h"
+#include "master/id_generator_interface.h"
 
-/*! \brief Get next free inode number.
- *
- * \param ts        - current time stamp
- * \param req_inode - request inode number
- *                    >0 - we request specific inode number
- *                     0 - get any free inode number
- *
- * \return 0  - no more free inodes
- *         >0 - allocated inode number (may differ from requested if it was already taken)
- */
-inode_t fsnodes_get_next_id(uint32_t ts, inode_t req_inode);
+/// Inode id generator using the inode pool from gMetadata.
+/// Provides the usual behavior but now implements the IIdGenerator interface to allow custom
+/// polymorphic generators.
+class IdGeneratorWithDetainer : public IIdGenerator<inode_t> {
+public:
+	IdGeneratorWithDetainer() = default;
+
+	/// Nothing to initialize in this implementation
+	bool initialize() override { return true; }
+
+	/// Get next free inode number.
+	///
+	/// @param timeStamp    Current time stamp (backward compatibility)
+	/// @param requestedId  Requested id: >0 - specific id, 0 - get any free id
+	///
+	/// @return 0 - no more free ids, >0 - allocated id (may differ from requested if already taken)
+	/// @note This implementation uses the inode pool from gMetadata to provide the usual behavior.
+	inode_t getNextId(uint32_t timeStamp, inode_t requestedId) override;
+
+	/// Gets next free id and prepares/obtains the next one.
+	/// Uses the inode pool detainer from gMetadata to provide the usual behavior.
+	inode_t getNextId() override { return getNextId(0, 0); }
+};

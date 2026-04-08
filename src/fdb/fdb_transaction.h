@@ -33,13 +33,11 @@ public:
 	/// @param tr The fdb::Transaction to wrap.
 	FDBTransaction(fdb::Transaction &&_tr) : tr_(std::move(_tr)), error_(0) {}
 
-	// Non-copyable, but movable (maybe to a queue of transactions).
+	// Non-copyable, non-movable (base class is non-movable)
 	FDBTransaction(const FDBTransaction &) = delete;
 	FDBTransaction &operator=(const FDBTransaction &) = delete;
-
-	/// Move constructor/assignment operator.
-	FDBTransaction(FDBTransaction &&) = default;
-	FDBTransaction &operator=(FDBTransaction &&) = default;
+	FDBTransaction(FDBTransaction &&) = delete;
+	FDBTransaction &operator=(FDBTransaction &&) = delete;
 
 	/// Default destructor. The members are RAII or simple.
 	~FDBTransaction() = default;
@@ -47,6 +45,21 @@ public:
 	/// Retrieves the value for a given key.
 	/// @param key The key to retrieve the value for.
 	std::optional<kv::Value> get(const kv::Key &key) override;
+
+	/// Retrieves the value for a given key without adding it to the
+	/// transaction's read conflict range (snapshot read).
+	/// @warning Snapshot reads do not participate in conflict checking and
+	///          must not be used for correctness-critical read-modify-write
+	///          logic. They are intended for advisory reads (e.g. observing
+	///          a hot counter) where occasional anomalies are acceptable.
+	/// @param key The key to retrieve the value for.
+	std::optional<kv::Value> getSnapshot(const kv::Key &key) override;
+
+	/// Retrieves the value for a given key asynchronously.
+	/// @param key The key to retrieve the value for.
+	/// @return A future that will contain the value when ready.
+	/// @note The transaction must remain alive until the future's get() method is called.
+	std::unique_ptr<kv::IFuture> getAsync(const kv::Key &key) override;
 
 	/// Retrieves a range of keys and values
 	/// @param start The starting key for the range.
@@ -60,12 +73,23 @@ public:
 	/// @param value The value to set for the key.
 	void set(const kv::Key &key, const kv::Value &value) override;
 
+	/// Atomically adds a delta value to the existing value for a given key.
+	/// @param key The key to add the delta to.
+	/// @param delta The delta value to add (must be little-endian).
+	void atomicAdd(const kv::Key &key, const kv::Value &delta) override;
+
 	/// Removes a key from the database.
 	/// @param key The key to remove.
 	void remove(const kv::Key &key) override;
 
+	/// Removes a half-open key range [start, end) from the database.
+	void removeRange(const kv::Key &start, const kv::Key &end) override;
+
 	/// Commits the transaction, making all changes permanent.
 	bool commit() override;
+
+	/// Returns the committed version of the transaction, if available.
+	std::optional<int64_t> getCommittedVersion() const override;
 
 	/// Returns the error code of the last operation.
 	fdb_error_t error() const { return error_; }

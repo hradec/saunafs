@@ -137,10 +137,15 @@ in a single write job. If possible, will try to make a single pwrite call
 
 *MAX_BLOCKS_PER_HDD_READ_JOB*:: maximum number of blocks read from the device
 in a single read job. If possible, will try to make a single pread call
-(default is 8, minimum is 1)
+(default is 16, minimum is 1)
 
 *MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY*:: maximum number of read jobs processed
-in parallel per client connection (default is 16)
+in parallel per client connection (default is 1)
+
+*MAX_BUFFERS_POOL_SIZE_MB*:: maximum size of the buffers pool used for read, write
+and replicate operations, in megabytes. Consider decreasing it if the system is
+running out of memory, or increasing it to improve performance if there is enough
+memory available. Unused buffers are regularly freed (default is 512)
 
 *READ_AHEAD_KB*:: additional number of kilobytes which should be passed to
 posix_fadvise(POSIX_FADV_WILLNEED) before reading data from a chunk (default is
@@ -152,8 +157,9 @@ how much of skipped data to read if an offset of some read operation is greater
 than the offset where the previous operation finished (default is 0, i.e. don't
 read any skipped data; the value is aligned down to 64 KiB)
 
-*PERFORM_FSYNC*:: call fsync() after a chunk is modified (default is 1, i.e.
-enabled)
+*PERFORM_FSYNC*:: call fsync() after a chunk is modified. In the case of individual
+write jobs it does not apply, but when closing the chunks (default is 1, i.e.
+enabled).
 
 *STAT_CHUNKS_AT_DISK_SCAN*:: verify that chunk metadata and data parts exists at
 scan time. If set to 1, the data part is also checked to be multiple of
@@ -173,27 +179,38 @@ the operation is considered failed and is immediately aborted (default: 1000)
 replication. After this timeout, next wave of read requests is sent to other
 chunkservers (default: 500)
 
-*CHUNK_TRASH_ENABLED (EXPERIMENTAL)*:: enables or disables the chunk trash
+*PLUGINS_DIR*:: directory to search for Chunkserver plugins (absolute path).
+When set, the plugin manager will search this directory first. If not set, then
+it will search in usual plugin locations, like PLUGINS_PATH/chunkserver (PLUGINS_PATH is 
+defined at build time), /usr/local/lib/saunafs/plugins/chunkserver, and
+/usr/lib/saunafs/plugins/chunkserver (default is empty string, i.e. disabled)
+
+*CHUNK_TRASH_ENABLED*:: enables or disables the chunk trash
 feature. When enabled, deleted chunks are moved to a trash directory instead of
 being immediately removed. (Default: 0)
 
-*CHUNK_TRASH_EXPIRATION_SECONDS (EXPERIMENTAL)*:: specifies the timeout in
+*CHUNK_TRASH_EXPIRATION_SECONDS*:: specifies the timeout in
 seconds for chunks to remain in the trash before being permanently deleted.
 (Default: 259200)
 
-*CHUNK_TRASH_FREE_SPACE_THRESHOLD_GB (EXPERIMENTAL)*:: sets the available space
+*CHUNK_TRASH_FREE_SPACE_THRESHOLD_GB*:: sets the available space
 threshold in gigabytes. If the available space on the disk falls below this
 threshold, the system will start deleting older chunks from the trash to free
 up space. A suggested value is about the 15% of the capacity of the smaller
 configured disk. (Default: 0)
 
-*CHUNK_TRASH_GC_BATCH_SIZE (EXPERIMENTAL)*:: defines the bulk size for the
-garbage collector when processing chunks in the trash. This determines how many
-files are processed in each garbage collection cycle. (Default: 1000)
+*CHUNK_TRASH_GC_BATCH_SIZE*:: defines the maximum bulk size 
+per disk for the garbage collector when processing chunks in the trash. 
+This value is used when no I/O pressure is detected and is dynamically 
+scaled down based on current disk load.
+(Default: 500)
 
-*CHUNK_TRASH_GC_SPACE_RECOVERY_BATCH_SIZE (EXPERIMENTAL)*:: [ADVANCED] The
+*CHUNK_TRASH_GC_SPACE_RECOVERY_BATCH_SIZE*:: [ADVANCED] The
 number of files to remove from the trash in a single GC cycle, in case the disk
 is full and space needs to be recovered. (Default: 100)
+
+*CHUNK_TRASH_GC_PURGE_WORKERS_NR*:: The number of workers purging files
+in parallel. (Default: 5)
 
 *LOG_LEVEL*:: Setup logging. Uses the environment variable SAUNAFS_LOG_LEVEL or
 config value LOG_LEVEL to determine logging level. Valid log levels are
@@ -205,9 +222,42 @@ config value LOG_LEVEL to determine logging level. Valid log levels are
 - 'crit' or 'critical'
 - 'off'
 
+*IO_PRIORITY_MODE (EXPERIMENTAL)*:: Define IO jobs, i.e reads and writes from drives,
+prioritization scheme. The available modes are:
+- 'FIFO': prioritizes the IO jobs first enqueued.
+- 'SWITCH': alternates read and write jobs (interleaving) to prevent one class of IO from
+starving the other.
+Not reloadable. (Default: FIFO)
+
+*WRITE_BUFFERING_SIZE_MB (EXPERIMENTAL)*:: Caps the amount of data in MiB the chunkserver
+"buffers", i.e fast replies to the client as if it was synced to the drives but it was
+only read from network and stored in memory. Similar to page cache. This feature has
+the following constraints:
+- does not work on standard (replica) chunks.
+- must have chunkserver side chunk locking enabled (see USE_CHUNKSERVER_SIDE_CHUNK_LOCK
+in master config).
+It is also suggested to set the IO_PRIORITY_MODE to SWITCH. The PERFORM_FSYNC
+continues working as intended, as it affects the time spent closing of the
+written chunk.
+Can provide better results for writes in general, but may significantly improve
+performance for small files.
+Reloadable. (Default: 0)
+
+*TLS_CERT_FILE (EXPERIMENTAL)*::
+Path to the TLS certificate file the chunk server will use for TLS connections
+(there is no default value).
+
+*TLS_KEY_FILE (EXPERIMENTAL)*::
+Path to the TLS private key file the chunk server will use for TLS connections
+(there is no default value).
+
+*TLS_CA_CERT_FILE (EXPERIMENTAL)*::
+Path to the trusted CA certificate which is used to authenticate through TLS
+to the master server (there is no default value).
+
 == REPORTING BUGS
 
-Report bugs to the Github repository <https://github.com/leil/saunafs> as an
+Report bugs to the GitHub repository <https://github.com/leil-io/saunafs> as an
 issue.
 
 

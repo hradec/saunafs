@@ -35,6 +35,7 @@
 #include <common/observable_property.h>
 #include <common/rotate_files.h>
 #include <common/saunafs_version.h>
+#include <common/scoped_timer.h>
 #include <common/setup.h>
 #include <common/type_defs.h>
 #include <master/changelog.h>
@@ -44,15 +45,17 @@
 #include <master/filesystem_node.h>
 #include <master/filesystem_node_types.h>
 #include <master/filesystem_operations.h>
+#include <master/filesystem_operations_interface.h>
 #include <master/filesystem_quota.h>
 #include <master/filesystem_store_acl.h>
 #include <master/matoclserv.h>
+#include <master/matoclserv_sessions.h>
 #include <master/matomlserv.h>
 #include <master/metadata_backend_common.h>
 #include <master/metadata_dumper_file.h>
 #include <master/restore.h>
+#include <protocol/SFSCommunication.h>
 #include <slogger/slogger.h>
-#include "protocol/SFSCommunication.h"
 
 MetadataBackendFile::MetadataBackendFile()
 #if !defined(METARESTORE) && !defined(METALOGGER)
@@ -183,7 +186,8 @@ uint8_t MetadataBackendFile::fs_storeall(DumpType dumpType) {
 	matomlserv_broadcast_logrotate();
 	// child == true says that we forked
 	// bg may be changed to dump in foreground in case of a fork error
-	bool child = dumper()->start(dumpType, fs_checksum(ChecksumMode::kGetCurrent));
+	bool child =
+	    dumper()->start(dumpType, gFSOperations->metadataChecksum(ChecksumMode::kGetCurrent));
 	uint8_t status = SAUNAFS_STATUS_OK;
 
 	if (dumpType == DumpType::kForegroundDump) {
@@ -282,12 +286,7 @@ static bool xattr_load(MetadataLoader::Options options) {
 		}
 
 		auto inodeHash = get_xattr_inode_hash(inode);
-		for (const auto &xattrEntry : gMetadata->xattrInodeHash[inodeHash]) {
-			xattrInodeEntry = xattrEntry.get();
-			if (xattrInodeEntry->inode == inode) {
-				break;
-			}
-		}
+		xattrInodeEntry = find_xattr_inode_entry(inode, inodeHash);
 
 		if (xattrInodeEntry != nullptr &&
 		    xattrInodeEntry->attributeNameLength + attributeNameLength + 1 > SFS_XATTR_LIST_MAX) {
@@ -369,20 +368,24 @@ static bool fs_load_generic(const std::shared_ptr<MemoryMappedFile> &metadataFil
 
 /**
  * @brief Parse an edge from the metadata file.
+ * @param fsOpContext The filesystem operation context (transaction).
  * @param metadataFile A reference to the memory mapped metadata file.
  * @param sectionOffset A reference to point to the next edge attribute.
  * @param ignoreFlag A flag to indicate whether to ignore the error.
  * @param init A flag to indicate whether to initialize the static variable.
  * @return 0 on success, 1 if last edge mark is found, -1 if unknown node type.
  */
-static int8_t fs_parseEdge(const std::shared_ptr<MemoryMappedFile> &metadataFile,
+static int8_t fs_parseEdge(const FilesystemOperationContext &fsOpContext,
+                           const std::shared_ptr<MemoryMappedFile> &metadataFile,
                            size_t &sectionOffset, int ignoreFlag, bool init = false) {
 	static const int8_t kError = -1;
 	static const int8_t kSuccess = 0;
 	static const int8_t kLastEdge = 1;
 	static inode_t currentParentId;
+	static FSNodeDirectory* currentParentNode;
 	if (init) {
 		currentParentId = 0;
+		currentParentNode = nullptr;
 		return kSuccess;
 	}
 	const auto* pSrc = metadataFile->seek(sectionOffset);
@@ -406,12 +409,11 @@ static int8_t fs_parseEdge(const std::shared_ptr<MemoryMappedFile> &metadataFile
 
 	std::string name(pSrc, pSrc + edgeNameSize);
 	sectionOffset += edgeNameSize;
-	FSNode *child = fsnodes_id_to_node(childId);
+	FSNode *child = gFSOperations->nodeOperations()->idToNode(fsOpContext, childId);
 	if (!child) {
 		safs_pretty_syslog(
-		    LOG_ERR,
-		    "loading edge: %" PRIiNode ",%s->%" PRIiNode " error: child not found",
-		    parentId, fsnodes_escape_name(name).c_str(), childId);
+		    LOG_ERR, "loading edge: %" PRIiNode ",%s->%" PRIiNode " error: child not found",
+		    parentId, gFSOperations->nodeOperations()->escapeName(name).c_str(), childId);
 		if (ignoreFlag) {
 			return kSuccess;
 		}
@@ -419,43 +421,49 @@ static int8_t fs_parseEdge(const std::shared_ptr<MemoryMappedFile> &metadataFile
 	}
 	if (!parentId) {
 		if (child->type == FSNodeType::kTrash) {
-			gMetadata->trash.insert(
-			    {TrashPathKey(child), hstorage::Handle(name)});
+			addTrashEntry(gMetadata->trash, gMetadata->trashHandlesIndex,
+			              gMetadata->trashReservedToId, child, name);
 			gMetadata->trashSpace += static_cast<FSNodeFile *>(child)->length;
 			gMetadata->trashNodes++;
 		} else if (child->type == FSNodeType::kReserved) {
-			gMetadata->reserved.insert({child->id, hstorage::Handle(name)});
+			addReservedEntry(gMetadata->reserved, gMetadata->reservedHandlesIndex,
+			                 gMetadata->trashReservedToId, child, name);
 			gMetadata->reservedSpace += static_cast<FSNodeFile *>(child)->length;
 			gMetadata->reservedNodes++;
 		} else {
 			safs::log_err("loading edge: {}, {}->{} error: bad child type ({})", parentId,
-			              fsnodes_escape_name(name), childId, static_cast<char>(child->type));
+			              gFSOperations->nodeOperations()->escapeName(name), childId,
+			              static_cast<char>(child->type));
 			return kError;
 		}
 	} else {
-		FSNodeDirectory *parent = fsnodes_id_to_node<FSNodeDirectory>(parentId);
+		FSNodeDirectory *parent;
+		if (currentParentId != parentId){
+			parent =
+			    gFSOperations->nodeOperations()->idToNode<FSNodeDirectory>(fsOpContext, parentId);
+			currentParentNode = parent;
+		} else {
+			parent = currentParentNode;
+		}
 		if (!parent) {
-			safs_pretty_syslog(LOG_ERR,
-			                   "loading edge: %" PRIiNode ",%s->%" PRIiNode
-			                   " error: parent not found",
-			                   parentId, fsnodes_escape_name(name).c_str(),
-			                   childId);
+			safs_pretty_syslog(
+			    LOG_ERR, "loading edge: %" PRIiNode ",%s->%" PRIiNode " error: parent not found",
+			    parentId, gFSOperations->nodeOperations()->escapeName(name).c_str(), childId);
 			if (ignoreFlag) {
-				parent =
-				    fsnodes_id_to_node<FSNodeDirectory>(SPECIAL_INODE_ROOT);
+				parent = gFSOperations->nodeOperations()->idToNode<FSNodeDirectory>(
+				    fsOpContext, SPECIAL_INODE_ROOT);
 				if (!parent || parent->type != FSNodeType::kDirectory) {
 					safs_pretty_syslog(
 					    LOG_ERR,
-					    "loading edge: %" PRIiNode ",%s->%" PRIiNode
-					    " root dir not found !!!",
-					    parentId, fsnodes_escape_name(name).c_str(), childId);
+					    "loading edge: %" PRIiNode ",%s->%" PRIiNode " root dir not found !!!",
+					    parentId, gFSOperations->nodeOperations()->escapeName(name).c_str(),
+					    childId);
 					return kError;
 				}
-				safs_pretty_syslog(LOG_ERR,
-				                   "loading edge: %" PRIiNode ",%s->%" PRIiNode
-				                   " attaching node to root dir",
-				                   parentId, fsnodes_escape_name(name).c_str(),
-				                   childId);
+				safs_pretty_syslog(
+				    LOG_ERR,
+				    "loading edge: %" PRIiNode ",%s->%" PRIiNode " attaching node to root dir",
+				    parentId, gFSOperations->nodeOperations()->escapeName(name).c_str(), childId);
 				parentId = SPECIAL_INODE_ROOT;
 			} else {
 				safs_pretty_syslog(
@@ -467,23 +475,23 @@ static int8_t fs_parseEdge(const std::shared_ptr<MemoryMappedFile> &metadataFile
 		}
 		if (parent->type != FSNodeType::kDirectory) {
 			safs::log_err("loading edge: {}, {}->{} error: bad parent type ({})", parentId,
-			              fsnodes_escape_name(name), childId, static_cast<char>(parent->type));
+			              gFSOperations->nodeOperations()->escapeName(name), childId,
+			              static_cast<char>(parent->type));
 			if (ignoreFlag) {
-				parent =
-				    fsnodes_id_to_node<FSNodeDirectory>(SPECIAL_INODE_ROOT);
+				parent = gFSOperations->nodeOperations()->idToNode<FSNodeDirectory>(
+				    fsOpContext, SPECIAL_INODE_ROOT);
 				if (!parent || parent->type != FSNodeType::kDirectory) {
 					safs_pretty_syslog(
 					    LOG_ERR,
-					    "loading edge: %" PRIiNode ",%s->%" PRIiNode
-					    " root dir not found !!!",
-					    parentId, fsnodes_escape_name(name).c_str(), childId);
+					    "loading edge: %" PRIiNode ",%s->%" PRIiNode " root dir not found !!!",
+					    parentId, gFSOperations->nodeOperations()->escapeName(name).c_str(),
+					    childId);
 					return kError;
 				}
-				safs_pretty_syslog(LOG_ERR,
-				                   "loading edge: %" PRIiNode ",%s->%" PRIiNode
-				                   " attaching node to root dir",
-				                   parentId, fsnodes_escape_name(name).c_str(),
-				                   childId);
+				safs_pretty_syslog(
+				    LOG_ERR,
+				    "loading edge: %" PRIiNode ",%s->%" PRIiNode " attaching node to root dir",
+				    parentId, gFSOperations->nodeOperations()->escapeName(name).c_str(), childId);
 				parentId = SPECIAL_INODE_ROOT;
 			} else {
 				safs_pretty_syslog(
@@ -495,48 +503,47 @@ static int8_t fs_parseEdge(const std::shared_ptr<MemoryMappedFile> &metadataFile
 		}
 		if (currentParentId != parentId) {
 			if (parent->entries.size() > 0) {
-				safs_pretty_syslog(LOG_ERR,
-				                   "loading edge: %" PRIiNode ",%s->%" PRIiNode
-				                   " error: parent node sequence error",
-				                   parentId, fsnodes_escape_name(name).c_str(),
-				                   childId);
+				safs_pretty_syslog(
+				    LOG_ERR,
+				    "loading edge: %" PRIiNode ",%s->%" PRIiNode
+				    " error: parent node sequence error",
+				    parentId, gFSOperations->nodeOperations()->escapeName(name).c_str(), childId);
 				return kError;
 			}
 			currentParentId = parentId;
 		}
 
-		hstorage::Handle *handlePtr = new hstorage::Handle(name);
-		auto it = parent->entries.insert({handlePtr, child}).first;
-		parent->entries_hash ^= (*it).first->hash();
-
-		if (parent->case_insensitive) {
-			HString lowerCaseName = HString::hstringToLowerCase(HString(name));
-			auto lowercaseHandlePtr = new hstorage::Handle(lowerCaseName);
-			auto it =
-			    parent->lowerCaseEntries.insert({lowercaseHandlePtr, child})
-			        .first;
-			parent->lowerCaseEntriesHash ^= (*it).first->hash();
+		auto *handlePtr = new hstorage::Handle(name);
+		if (parent->entries.insert({handlePtr, child}).second) {
+			// On successful insert update the hash
+			parent->entries_hash ^= handlePtr->hash();
+		} else {
+			// insert failed → nobody owns handlePtr → delete it
+			delete handlePtr;
+			return kError;
 		}
 
-		child->parents.push_back({parent->id, handlePtr});
+		child->parents.push_back({parentId, handlePtr});
 		if (child->type == FSNodeType::kDirectory) {
 			parent->nlink++;
 		}
 
 		StatsRecord sr;
-		fsnodes_get_stats(child, &sr);
-		fsnodes_add_stats(parent, &sr);
+		gFSOperations->nodeOperations()->getStats(fsOpContext, child, &sr);
+		gFSOperations->nodeOperations()->addStats(fsOpContext, parent, &sr);
 	}
 	return kSuccess;
 }
 
 /**
- * @brief
- * @param pSrc A pointer to the data storing all nodes.
+ * @brief Parse a node from the metadata file.
+ * @param fsOpContext The filesystem operation context (transaction).
+ * @param metadataFile A reference to the memory mapped metadata file.
  * @param sectionOffset A reference to point to the next node attribute.
  * @return 0 on success, 1 if last node mark is found, -1 if unknown node type.
  */
-static int8_t fs_parseNode(const std::shared_ptr<MemoryMappedFile> &metadataFile,
+static int8_t fs_parseNode(const FilesystemOperationContext &fsOpContext,
+                           const std::shared_ptr<MemoryMappedFile> &metadataFile,
                            size_t &sectionOffset) {
 	static constexpr int8_t kError = -1;
 	static constexpr int8_t kSuccess = 0;
@@ -588,7 +595,9 @@ static int8_t fs_parseNode(const std::shared_ptr<MemoryMappedFile> &metadataFile
 			matoclserv_add_open_file(sessionId, node->id);
 		}
 #endif
-		fsnodes_quota_update(node, {{QuotaResource::kSize, +fsnodes_get_size(node)}});
+		fsnodes_quota_update(
+		    node,
+		    {{QuotaResource::kSize, +gFSOperations->nodeOperations()->getSize(fsOpContext, node)}});
 		gMetadata->fileNodes++;
 		break;
 	default:
@@ -612,6 +621,10 @@ static int fs_lostnode(FSNode *p) {
 	uint8_t artname[40];
 	uint32_t i, l;
 	i = 0;
+
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadWrite);
+
 	do {
 		if (i == 0) {
 			l = snprintf((char *)artname, 40, "lost_node_%" PRIiNode, p->id);
@@ -619,9 +632,16 @@ static int fs_lostnode(FSNode *p) {
 			l = snprintf((char *)artname, 40, "lost_node_%" PRIiNode ".%" PRIu32,
 			             p->id, i);
 		}
+
 		HString name((const char *)artname, l);
-		if (!fsnodes_nameisused(gMetadata->root, name)) {
-			fsnodes_link(0, gMetadata->root, p, name);
+
+		if (!gFSOperations->nodeOperations()->isNameUsed(fsOpContext, gMetadata->root, name)) {
+
+			gFSOperations->nodeOperations()->link(fsOpContext, 0, gMetadata->root, p, name);
+
+			// No need to commit the transaction here, the file backend doesn't use transactions for
+			// persistence, but we need to provide the context for API compatibility.
+
 			return 1;
 		}
 		i++;
@@ -650,9 +670,11 @@ int fs_checknodes(int ignoreflag) {
 }
 
 static bool fs_loadnodes(MetadataLoader::Options options) {
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadOnly);
 	int8_t status;
 	do {
-		status = fs_parseNode(options.metadataFile, options.offset);
+		status = fs_parseNode(fsOpContext, options.metadataFile, options.offset);
 		if (status < 0) {
 			return false;
 		}
@@ -661,10 +683,13 @@ static bool fs_loadnodes(MetadataLoader::Options options) {
 }
 
 static bool fs_loadedges(MetadataLoader::Options options) {
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadOnly);
 	int8_t status;
-	fs_parseEdge(options.metadataFile, options.offset, options.ignoreFlag, true);
+	fs_parseEdge(fsOpContext, options.metadataFile, options.offset, options.ignoreFlag, true);
 	do {
-		status = fs_parseEdge(options.metadataFile, options.offset, options.ignoreFlag);
+		status =
+		    fs_parseEdge(fsOpContext, options.metadataFile, options.offset, options.ignoreFlag);
 		if (status < 0) {
 			return false;
 		}
@@ -822,8 +847,7 @@ static int fs_load(const std::shared_ptr<MemoryMappedFile> &metadataFile, int ig
 		size_t sectionOffset = sectionMarkers[section.name].first;
 		uint64_t sectionLength = sectionMarkers[section.name].second;
 		if (section.isLegacy) {
-			safs_pretty_syslog(LOG_WARNING, "legacy section found (%s)",
-			                   section.name.data());
+			safs::log_warn("legacy section found ({})", section.name.data());
 			continue;
 		}
 		auto options = MetadataLoader::Options{metadataFile, sectionOffset,
@@ -845,18 +869,22 @@ static int fs_load(const std::shared_ptr<MemoryMappedFile> &metadataFile, int ig
 	if (!success) {
 		return kOpFailure;
 	}
-	safs_pretty_syslog_attempt(
-	    LOG_INFO, "checking filesystem consistency of the metadata file");
+	safs::log_info("checking filesystem consistency of the metadata file");
 	fflush(stderr);
-	gMetadata->root = fsnodes_id_to_node<FSNodeDirectory>(SPECIAL_INODE_ROOT);
+
+	util::ScopedTimer timer("checking filesystem consistency of the metadata file took");
+
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadOnly);
+
+	gMetadata->root =
+	    gFSOperations->nodeOperations()->idToNode<FSNodeDirectory>(fsOpContext, SPECIAL_INODE_ROOT);
 	if (gMetadata->root == nullptr) {
-		safs_pretty_syslog(LOG_ERR,
-		                   "error reading metadata (root node not found)");
+		safs::log_err("error reading metadata (root node not found)");
 		return kOpFailure;
 	}
 	if (gMetadata->root->type != FSNodeType::kDirectory) {
-		safs_pretty_syslog(
-		    LOG_ERR, "error reading metadata (root node not a directory)");
+		safs::log_err("error reading metadata (root node not a directory)");
 		return kOpFailure;
 	}
 	if (fs_checknodes(ignoreflag) < 0) {
@@ -894,7 +922,7 @@ void fs_new(void) {
 	gMetadata->dirNodes = 1;
 	gMetadata->fileNodes = 0;
 
-	fs_checksum(ChecksumMode::kForceRecalculate);
+	gFSOperations->metadataChecksum(ChecksumMode::kForceRecalculate);
 	fsnodes_quota_update(gMetadata->root, {{QuotaResource::kInodes, +1}});
 }
 
@@ -953,19 +981,22 @@ void MetadataBackendFile::loadall(int ignoreflag) {
 	if (fs_load(metadataFile, ignoreflag) != kOpSuccess) {
 		throw MetadataConsistencyException(MetadataStructureReadErrorMsg);
 	}
-	safs_pretty_syslog_attempt(LOG_INFO, "connecting files and chunks");
-	fs_add_files_to_chunks();
+	safs::log_info("connecting files and chunks");
+	{
+		util::ScopedTimer timer("connecting files and chunks took");
+		gFSOperations->addFilesToChunks();
+	}
 	unlink(kMetadataTmpFilename);
-	safs_pretty_syslog_attempt(LOG_INFO,
-	                           "calculating checksum of the metadata");
-	fs_checksum(ChecksumMode::kForceRecalculate);
+	safs::log_info("calculating checksum of the metadata");
+	{
+		util::ScopedTimer timer("calculating checksum of the metadata took");
+		gFSOperations->metadataChecksum(ChecksumMode::kForceRecalculate);
+	}
 
 #ifndef METARESTORE
-	safs_pretty_syslog(
-	    LOG_INFO,
-	    "metadata file %s read (%" PRIiNode " inodes including %" PRIiNode
-	    " directory inodes, %" PRIiNode " file inodes, %" PRIiNode
-	    " symlink inodes and %" PRIu32 " chunks)",
+	safs::log_info(
+	    "metadata file {} read ({} inodes including {} directory inodes, {} file inodes, "
+	    "{} symlink inodes and {} chunks)",
 	    metadataFile->filename().c_str(), gMetadata->nodes, gMetadata->dirNodes,
 	    gMetadata->fileNodes, gMetadata->linkNodes, chunk_count());
 #else
@@ -1082,9 +1113,9 @@ void MetadataBackendFile::storeedge(FSNodeDirectory *parent, FSNode *child,
                                     const std::string &name, FILE *fd) {
 	uint8_t *ptr;
 	if (child == nullptr) {  // last edge
-		memset(gEdgeStoreBuffer, 0, kEdgeHeaderSize);
-		if (fwrite(gEdgeStoreBuffer, 1, kEdgeHeaderSize, fd) !=
-		    (size_t)(kEdgeHeaderSize)) {
+		memset(gEdgeStoreBuffer, 0, FSNode::kEdgeHeaderSize);
+		if (fwrite(gEdgeStoreBuffer, 1, FSNode::kEdgeHeaderSize, fd) !=
+		    (size_t)(FSNode::kEdgeHeaderSize)) {
 			safs_pretty_syslog(LOG_NOTICE, "fwrite error");
 			return;
 		}
@@ -1095,8 +1126,8 @@ void MetadataBackendFile::storeedge(FSNodeDirectory *parent, FSNode *child,
 	putINode(&ptr, child->id);
 	put16bit(&ptr, name.length());
 	memcpy(ptr, name.c_str(), name.length());
-	if (fwrite(gEdgeStoreBuffer, 1, kEdgeHeaderSize + name.length(), fd) !=
-	    (size_t)(kEdgeHeaderSize + name.length())) {
+	if (fwrite(gEdgeStoreBuffer, 1, FSNode::kEdgeHeaderSize + name.length(), fd) !=
+	    (size_t)(FSNode::kEdgeHeaderSize + name.length())) {
 		safs_pretty_syslog(LOG_NOTICE, "fwrite error");
 		return;
 	}
@@ -1109,15 +1140,19 @@ void MetadataBackendFile::storeedgelist(FSNodeDirectory *parent, FILE *fd) {
 }
 
 void MetadataBackendFile::storeedgelist(const TrashPathContainer &data, FILE *fd) {
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadOnly);
 	for (const auto &entry : data) {
-		FSNode *child = fsnodes_id_to_node(entry.first.id);
+		FSNode *child = gFSOperations->nodeOperations()->idToNode(fsOpContext, entry.first.id);
 		storeedge(nullptr, child, (std::string)entry.second, fd);
 	}
 }
 
 void MetadataBackendFile::storeedgelist(const ReservedPathContainer &data, FILE *fd) {
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadOnly);
 	for (const auto &entry : data) {
-		FSNode *child = fsnodes_id_to_node(entry.first);
+		FSNode *child = gFSOperations->nodeOperations()->idToNode(fsOpContext, entry.first);
 		storeedge(nullptr, child, (std::string)entry.second, fd);
 	}
 }

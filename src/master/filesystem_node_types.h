@@ -33,22 +33,10 @@
 #include "common/datapack.h"
 #include "common/goal.h"
 #include "common/serializable_interface.h"
+#include "common/skip_list.h"
 #include "common/type_defs.h"
 #include "protocol/SFSCommunication.h"
-
-#if defined(SAUNAFS_HAVE_64BIT_JUDY) &&               \
-    (!defined(DISABLE_JUDY_FOR_TRASHPATHCONTAINER) || \
-     !defined(DISABLE_JUDY_FOR_RESERVEDPATHCONTAINER))
-#include "common/judy_map.h"
-#endif
-#if !defined(SAUNAFS_HAVE_64BIT_JUDY) ||            \
-    defined(DISABLE_JUDY_FOR_TRASHPATHCONTAINER) || \
-    defined(DISABLE_JUDY_FOR_RESERVEDPATHCONTAINER)
-#include <map>
-#endif
-
-#include <ext/pb_ds/assoc_container.hpp>
-#include <ext/pb_ds/tree_policy.hpp>
+#include "slogger/slogger.h"
 
 #include "master/hstring_storage.h"
 
@@ -62,7 +50,7 @@
 #define EDGEHASHPOS(hash) ((hash) & (EDGEHASHSIZE - 1))
 #define EDGECHECKSUMSEED 1231241261
 
-#define MAX_INDEX 0x7FFFFFFF
+constexpr uint32_t kMaxChunkIndex = 0x7FFFFFFFU;
 
 enum class AclInheritance : std::uint8_t {
 	kInheritAcl,
@@ -89,7 +77,6 @@ enum class ExpectedNodeType : std::uint8_t {
 	kAny
 };
 
-using TrashtimeMap = std::unordered_map<uint32_t, uint32_t>;
 using GoalStatistics = std::array<inode_t, GoalId::kMax + 1>;
 using ParentsCompactVector = compact_vector<std::pair<inode_t, const hstorage::Handle *>, uint32_t>;
 
@@ -153,6 +140,10 @@ public:
 	static constexpr size_t kNodeHeaderSize =
 	    sizeof(type) + sizeof(id) + sizeof(goal) + sizeof(mode) + sizeof(uid) + sizeof(gid) +
 	    sizeof(atime) + sizeof(mtime) + sizeof(ctime) + sizeof(trashtime);
+
+	static constexpr uint16_t kEdgeNameMaxSize = 65535;
+	static constexpr uint8_t kEdgeHeaderSize =
+	    sizeof(FSNode::id) + sizeof(FSNode::id) + sizeof(kEdgeNameMaxSize);
 
 	explicit FSNode(FSNodeType type_) : type(type_) {}
 
@@ -381,8 +372,6 @@ public:
 
 /*! \brief Node used for storing directory.
  *
- * Node size = 64 + 56 + 16 * entries_count
- * Avg size (10 files) ~ 280B (28B per file)
  */
 class FSNodeDirectory : public FSNode {
 public:
@@ -394,11 +383,14 @@ public:
 		}
 	};
 
-	using EntriesContainer =
-	    __gnu_pbds::tree<std::pair<hstorage::Handle *, FSNode *>,
-	                     __gnu_pbds::null_type, HandleCompare,
-	                     __gnu_pbds::rb_tree_tag,
-	                     __gnu_pbds::tree_order_statistics_node_update>;
+	/// These parameters achieve good results in reducing memory consumption
+	/// Numerator of non-promotion probability P
+	static constexpr uint32_t kDefaultSkipListProbNum = 3;
+	/// Denominator of non-promotion probability P
+	static constexpr uint32_t kDefaultSkipListProbDen = 4; 
+
+	using EntriesContainer = SkipList<std::pair<hstorage::Handle *, FSNode *>, HandleCompare,
+	                                  kDefaultSkipListProbNum, kDefaultSkipListProbDen>;
 
 	using iterator = EntriesContainer::iterator;
 	using const_iterator = EntriesContainer::const_iterator;
@@ -406,11 +398,10 @@ public:
 	EntriesContainer entries;  ///< Directory entries (entry: name + pointer to child node).
 	/// Directory entries with lower case name (entry: name + pointer to child node).
 	EntriesContainer lowerCaseEntries;
-	bool case_insensitive = false;  ///< Flag for case insensitive search.
+	bool caseInsensitive = false;  ///< Flag for case insensitive search.
 	StatsRecord stats;              ///< Directory statistics (including subdirectories).
 	uint32_t nlink{2};              ///< Number of directories linking to this directory.
 	uint16_t entries_hash{};
-	uint16_t lowerCaseEntriesHash{};
 
 	explicit FSNodeDirectory() : FSNode(FSNodeType::kDirectory) {
 		memset(&stats, 0, sizeof(stats));
@@ -425,7 +416,7 @@ public:
 	iterator find(const HString &name) {
 		uint64_t name_hash = (hstorage::Handle::HashType)name.hash();
 
-		if (case_insensitive) {
+		if (caseInsensitive) {
 			HString lowerCaseNameHandle = HString::hstringToLowerCase(name);
 			name_hash = (hstorage::Handle::HashType)lowerCaseNameHandle.hash();
 			auto tmp_handle = hstorage::Handle(name_hash << hstorage::Handle::kHashShift);
@@ -456,7 +447,7 @@ public:
 	iterator find_lowercase_container(const HString &name) {
 		uint64_t name_hash = (hstorage::Handle::HashType)name.hash();
 
-		if (case_insensitive) {
+		if (caseInsensitive) {
 			HString lowerCaseNameHandle = HString::hstringToLowerCase(name);
 			name_hash = (hstorage::Handle::HashType)lowerCaseNameHandle.hash();
 			auto tmp_handle = hstorage::Handle(name_hash << hstorage::Handle::kHashShift);
@@ -505,9 +496,106 @@ public:
 	 */
 	std::string getChildName(const FSNode *node) const {
 		for (const auto &[parentId, hstring] : node->parents) {
-			if (parentId == this->id) { return hstring->get(); }
+			if (parentId == this->id) { return hstring ? hstring->get() : std::string{}; }
 		}
 		return {};
+	}
+
+	/*! \brief Returns the original stored child name for any-case input.
+	 *
+	 * This function is only meaningful for directories with the case-insensitive flag set.
+	 * If the directory is not case-insensitive, it will always return an empty string.
+	 *
+	 * The function works as follows:
+	 * - It takes any-case input (e.g., "FoO").
+	 * - It converts the input to lower case and looks up the corresponding entry in
+	 *   the lowerCaseEntries container (e.g., "foo").
+	 * - If a match is found, it returns the original stored name as it was first added
+	 *   to the parent directory (e.g., returns "Foo" if that was the original casing).
+	 * - If no match is found, or the directory is not case-insensitive, it returns an empty string.
+	 *
+	 * Example:
+	 *   - Directory contains an entry stored as "Foo".
+	 *   - getBaseStoredChildName("FoO") will return "Foo".
+	 *
+	 * \param anyCaseName Any-case name to look up.
+	 * \return The original stored child name (with original casing), or empty string if not found.
+	 */
+	std::string getBaseStoredChildName(const std::string &anyCaseName) {
+		if (!caseInsensitive) { return {}; }
+
+		// caseInsensitive path
+		HString inputH(anyCaseName);
+		HString lowerCaseNameHandle = HString::hstringToLowerCase(inputH);
+		uint64_t lowerCaseHash = (hstorage::Handle::HashType)lowerCaseNameHandle.hash();
+		hstorage::Handle tmp(lowerCaseHash << hstorage::Handle::kHashShift);
+		auto pairToFind = std::make_pair(&tmp, kUnknownNode);
+		auto lowerIt = lowerCaseEntries.lower_bound(pairToFind);
+
+		for (; lowerIt != lowerCaseEntries.end(); ++lowerIt) {
+			if ((*lowerIt).first->hash() != lowerCaseHash) { break; }
+			if (*((*lowerIt).first) == lowerCaseNameHandle) {
+				FSNode *child = (*lowerIt).second;
+				if (!child) { return {}; }
+				// ORIGINAL name from parents vector (first stored casing).
+				for (const auto &[parentId, nameHandle] : child->parents) {
+					if (parentId != this->id) { continue; }
+					if (nameHandle == nullptr) { return {}; }
+					return static_cast<std::string>(*nameHandle);
+				}
+
+				// Fallback: scan entries for pointer equality (should rarely be needed).
+				for (auto it = entries.begin(); it != entries.end(); ++it) {
+					if ((*it).second == child) {
+						safs::log_warn(
+						    "Inconsistent filesystem tree: fallback used in getBaseStoredChildName for directory id {}",
+						    this->id);
+						return std::string((*it).first->get());
+					}
+				}
+				return {};
+			}
+		}
+		return {};
+	}
+
+	/*!
+	 * \brief Updates lowerCaseEntries for all entries according to caseInsensitive flag.
+	 *
+	 * For case-insensitive directories, this populates lowerCaseEntries so that
+	 * lookups can be performed in a case-insensitive manner. If multiple entries
+	 * exist whose names differ only by case (e.g., "foo" and "Foo"), only one of
+	 * them will be present in lowerCaseEntries after this operation—the first one
+	 * encountered during iteration. This means only one will be found by a
+	 * case-insensitive lookup, and others will be hidden.
+	 */
+	void updateLowerCaseEntries() {
+		if (!caseInsensitive) {
+			// Clear and free all lowerCaseEntries
+			for (auto it = lowerCaseEntries.begin(); it != lowerCaseEntries.end();) {
+				delete it->first;
+				auto entryToErase = it++;
+				lowerCaseEntries.erase(entryToErase);
+			}
+
+			lowerCaseEntries.clear();
+			return;
+		}
+
+		// Populate lowerCaseEntries for all entries in entries
+		for (const auto &entry : entries) {
+			FSNode *child = entry.second;
+			HString lowerCaseName = HString::hstringToLowerCase(entry.first->get());
+
+			// Reuse find_lowercase_container to check if already present
+			auto lowerCaseIt = find_lowercase_container(lowerCaseName);
+			bool found = (lowerCaseIt != lowerCaseEntries.end());
+
+			if (!found) {
+				auto *lowercaseHandlePtr = new hstorage::Handle(lowerCaseName);
+				lowerCaseEntries.insert({lowercaseHandlePtr, child});
+			}
+		}
 	}
 
 	iterator begin() { return entries.begin(); }
@@ -535,42 +623,3 @@ public:
 		FSNode::deserialize(source);
 	}
 };
-
-struct TrashPathKey {
-	explicit TrashPathKey(const FSNode *node) :
-#ifdef WORDS_BIGENDIAN
-	    timestamp(std::min((uint64_t)node->ctime + node->trashtime, (uint64_t)UINT32_MAX)),
-	    id(node->id)
-#else
-	    id(node->id),
-	    timestamp(std::min((uint64_t)node->ctime + node->trashtime, (uint64_t)UINT32_MAX))
-#endif
-	{}
-
-	bool operator<(const TrashPathKey &other) const {
-		return std::make_pair(timestamp, id) < std::make_pair(other.timestamp, other.id);
-	}
-
-#ifdef WORDS_BIGENDIAN
-	uint32_t timestamp;
-	// inode_t id;
-	uint32_t id;
-#else
-	// TODO(Guillex): the type should be inode_t, but there is an issue with Judy
-	// inode_t id;
-	uint32_t id;
-	uint32_t timestamp;
-#endif
-};
-
-#if defined(SAUNAFS_HAVE_64BIT_JUDY) && !defined(DISABLE_JUDY_FOR_TRASHPATHCONTAINER)
-using TrashPathContainer = judy_map<TrashPathKey, hstorage::Handle>;
-#else
-using TrashPathContainer = std::map<TrashPathKey, hstorage::Handle>;
-#endif
-
-#if defined(SAUNAFS_HAVE_64BIT_JUDY) && !defined(DISABLE_JUDY_FOR_RESERVEDPATHCONTAINER)
-using ReservedPathContainer = judy_map<inode_t, hstorage::Handle>;
-#else
-using ReservedPathContainer = std::map<inode_t, hstorage::Handle>;
-#endif

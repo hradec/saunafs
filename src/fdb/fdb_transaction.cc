@@ -18,12 +18,26 @@
 
 #include "fdb/fdb_transaction.h"
 
+#include "kv/ifuture.h"
+
 namespace fdb {
 
 std::optional<kv::Value> FDBTransaction::get(const kv::Key &key) {
 	if (!tr_) { return std::nullopt; }
 
 	return tr_.get(key);
+}
+
+std::optional<kv::Value> FDBTransaction::getSnapshot(const kv::Key &key) {
+	if (!tr_) { return std::nullopt; }
+
+	return tr_.get(key, /*snapshot=*/true);
+}
+
+std::unique_ptr<kv::IFuture> FDBTransaction::getAsync(const kv::Key &key) {
+	if (!tr_) { return nullptr; }
+
+	return tr_.getAsync(key);
 }
 
 kv::GetRangeResult FDBTransaction::getRange(const kv::KeySelector &start,
@@ -39,16 +53,32 @@ void FDBTransaction::set(const kv::Key &key, const kv::Value &value) {
 	tr_.set(key, value);
 }
 
+void FDBTransaction::atomicAdd(const kv::Key &key, const kv::Value &delta) {
+	if (!tr_) { return; }
+
+	tr_.atomicAdd(key, delta);
+}
+
 void FDBTransaction::remove(const kv::Key &key) {
 	if (!tr_) { return; }
 
 	tr_.remove(key);
 }
 
+void FDBTransaction::removeRange(const kv::Key &start, const kv::Key &end) {
+	if (!tr_) { return; }
+
+	tr_.removeRange(start, end);
+}
+
 bool FDBTransaction::commit() {
 	if (!tr_) { return false; }
 
 	return tr_.commit();
+}
+
+std::optional<int64_t> FDBTransaction::getCommittedVersion() const {
+	return tr_.getCommittedVersion();
 }
 
 }  // namespace fdb

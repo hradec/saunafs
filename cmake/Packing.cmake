@@ -1,4 +1,4 @@
-set(CPACK_GENERATOR "DEB")
+set(CPACK_GENERATOR "DEB;RPM")
 set(CPACK_PACKAGE_NAME "${PROJECT_NAME}"
         CACHE STRING "Name of package to be built"
 )
@@ -35,11 +35,9 @@ set(
     WORLD_READ WORLD_EXECUTE
 )
 
-set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
-
 set(CPACK_PACKAGE_VERSION_MAJOR ${PACKAGE_VERSION_MAJOR})
 set(CPACK_PACKAGE_VERSION_MINOR ${PACKAGE_VERSION_MINOR})
-set(CPACK_PACKAGE_VERSION_PATCH ${PACKAGE_VERSION_PATCH})
+set(CPACK_PACKAGE_VERSION_PATCH ${PACKAGE_VERSION_MICRO})
 
 set(CPACK_COMPONENTS_GROUPING IGNORE)
 
@@ -51,12 +49,48 @@ set(CPACK_DEBIAN_DEBUGINFO_PACKAGE ON)
 
 set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
 ## TODO(Baldor): Set dependencies for the package
-#set(CPACK_DEBIAN_PACKAGE_DEPENDS "asciidoc, debhelper, cmake, libfuse3-dev, pkg-config, zlib1g-dev, libspdlog-dev, libfmt-dev, libboost-system-dev, libboost-program-options-dev, python3")
+#set(CPACK_DEBIAN_PACKAGE_DEPENDS "asciidoctor, debhelper, cmake, libfuse3-dev, pkg-config, zlib1g-dev, libspdlog-dev, libfmt-dev, libboost-system-dev, libboost-program-options-dev, python3")
 set(CPACK_DEBIAN_ENABLE_COMPONENT_DEPENDS ON)
 
-# Remove the Unspecified package
-get_cmake_property(CPACK_COMPONENTS_ALL COMPONENTS)
-list(REMOVE_ITEM CPACK_COMPONENTS_ALL "Unspecified")
+# RPM configuration (client component)
+set(CPACK_RPM_COMPONENT_INSTALL ON)
+set(CPACK_RPM_PACKAGE_VERSION "${PACKAGE_VERSION}")
+set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
+set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-only")
+
+# RPM version must be numeric only (no hyphens). Encode any suffix into
+# the release field so that e.g. "5.8.0-dev" becomes Version 5.8.0,
+# Release 0.dev.1 (sorts lower than a plain release "1").
+set(CPACK_RPM_PACKAGE_VERSION
+    "${PACKAGE_VERSION_MAJOR}.${PACKAGE_VERSION_MINOR}.${PACKAGE_VERSION_MICRO}")
+
+# Determine version suffix for the RPM release field.
+if(DEFINED VERSION_SUFFIX)
+  string(REGEX REPLACE "^-" "" _version_suffix "${VERSION_SUFFIX}")
+else()
+  set(_version_suffix "dev")
+endif()
+
+if(_version_suffix STREQUAL "official")
+  set(CPACK_RPM_PACKAGE_RELEASE 1 CACHE STRING "RPM package release number")
+else()
+  set(CPACK_RPM_PACKAGE_RELEASE "0.${_version_suffix}.1" CACHE STRING "RPM package release number")
+endif()
+
+set(CPACK_RPM_PACKAGE_AUTOREQPROV "yes")
+set(CPACK_RPM_DEBUGINFO_PACKAGE ON)
+set(CPACK_RPM_CLIENT_PACKAGE_NAME "saunafs-client")
+set(CPACK_RPM_CLIENT_PACKAGE_SUMMARY "SaunaFS Client")
+set(CPACK_RPM_CLIENT_PACKAGE_DESCRIPTION "SaunaFS client libraries, mount helper, example configs, and shell completion.")
+
+set(CPACK_COMPONENT_CLIENT_DISPLAY_NAME "SaunaFS Client")
+set(CPACK_COMPONENT_CLIENT_DESCRIPTION "SaunaFS client libraries, mount helper, configs, and shell completion.")
+
+# Remove the Unspecified package unless the user explicitly provided components
+if(NOT CPACK_COMPONENTS_ALL)
+  get_cmake_property(CPACK_COMPONENTS_ALL COMPONENTS)
+  list(REMOVE_ITEM CPACK_COMPONENTS_ALL "Unspecified")
+endif()
 
 include(CPack)
 message(STATUS "Components to pack: ${CPACK_COMPONENTS_ALL}")

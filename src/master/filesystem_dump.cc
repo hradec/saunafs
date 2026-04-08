@@ -25,22 +25,23 @@
 #include "master/filesystem_freenode.h"
 #include "master/filesystem_metadata.h"
 #include "master/filesystem_node.h"
+#include "master/filesystem_operations_interface.h"
 
 void fs_dumpedge(FSNodeDirectory *parent, FSNode *child, const std::string &name) {
 	if (parent == NULL) {
 		if (child->type == FSNodeType::kTrash) {
 			printf("E|p:     TRASH|c:%10" PRIiNode "|n:%s\n", child->id,
-			       fsnodes_escape_name(name).c_str());
+			       gFSOperations->nodeOperations()->escapeName(name).c_str());
 		} else if (child->type == FSNodeType::kReserved) {
 			printf("E|p:  RESERVED|c:%10" PRIiNode "|n:%s\n", child->id,
-			       fsnodes_escape_name(name).c_str());
+			       gFSOperations->nodeOperations()->escapeName(name).c_str());
 		} else {
 			printf("E|p:      NULL|c:%10" PRIiNode "|n:%s\n", child->id,
-			       fsnodes_escape_name(name).c_str());
+			       gFSOperations->nodeOperations()->escapeName(name).c_str());
 		}
 	} else {
 		printf("E|p:%10" PRIiNode "|c:%10" PRIiNode "|n:%s\n", parent->id, child->id,
-		       fsnodes_escape_name(name).c_str());
+		       gFSOperations->nodeOperations()->escapeName(name).c_str());
 	}
 }
 
@@ -83,14 +84,16 @@ void fs_dumpnode(FSNode *f) {
 
 	printf("%c|i:%10" PRIiNode "|#:%" PRIu8 "|e:%1" PRIX16 "|m:%04" PRIo16 "|u:%10" PRIu32
 	       "|g:%10" PRIu32 "|a:%10" PRIu32 ",m:%10" PRIu32 ",c:%10" PRIu32 "|t:%10" PRIu32,
-	       c, f->id, f->goal, (uint16_t)(f->mode >> 12), (uint16_t)(f->mode & 0xFFF), f->uid,
-	       f->gid, f->atime, f->mtime, f->ctime, f->trashtime);
+	       c, f->id, f->goal, (uint16_t)(f->mode >> EATTR_BIT_OFFSET), (uint16_t)(f->mode & 0xFFF),
+	       f->uid, f->gid, f->atime, f->mtime, f->ctime, f->trashtime);
 
 	if (f->type == FSNodeType::kBlockDev || f->type == FSNodeType::kCharDev) {
 		printf("|d:%5" PRIu32 ",%5" PRIu32 "\n", static_cast<FSNodeDevice*>(f)->rdev >> 16,
 		       static_cast<FSNodeDevice*>(f)->rdev & 0xFFFF);
 	} else if (f->type == FSNodeType::kSymlink) {
-		printf("|p:%s\n", fsnodes_escape_name((std::string)static_cast<FSNodeSymlink*>(f)->path).c_str());
+		printf("|p:%s\n", gFSOperations->nodeOperations()
+		                      ->escapeName((std::string) static_cast<FSNodeSymlink *>(f)->path)
+		                      .c_str());
 	} else if (f->type == FSNodeType::kFile || f->type == FSNodeType::kTrash ||
 	           f->type == FSNodeType::kReserved) {
 		FSNodeFile *node_file = static_cast<FSNodeFile*>(f);
@@ -133,7 +136,7 @@ void fs_dumpedgelist(FSNodeDirectory *parent) {
 	for (const auto &entry : parent->entries) {
 		fs_dumpedge(parent, entry.second, (std::string)(*entry.first));
 	}
-	if (parent->case_insensitive) {
+	if (parent->caseInsensitive) {
 		for (const auto &entry : parent->lowerCaseEntries) {
 			fs_dumpedge(parent, entry.second, (std::string)(*entry.first));
 		}
@@ -141,15 +144,19 @@ void fs_dumpedgelist(FSNodeDirectory *parent) {
 }
 
 void fs_dumpedgelist(const TrashPathContainer &data) {
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadOnly);
 	for (const auto &entry : data) {
-		FSNode *child = fsnodes_id_to_node(entry.first.id);
+		FSNode *child = gFSOperations->nodeOperations()->idToNode(fsOpContext, entry.first.id);
 		fs_dumpedge(nullptr, child, (std::string)entry.second);
 	}
 }
 
 void fs_dumpedgelist(const ReservedPathContainer &data) {
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadOnly);
 	for (const auto &entry : data) {
-		FSNode *child = fsnodes_id_to_node(entry.first);
+		FSNode *child = gFSOperations->nodeOperations()->idToNode(fsOpContext, entry.first);
 		fs_dumpedge(nullptr, child, (std::string)entry.second);
 	}
 }
@@ -162,7 +169,7 @@ void fs_dumpedges(FSNodeDirectory *parent) {
 			fs_dumpedges(static_cast<FSNodeDirectory*>(child));
 		}
 	}
-	if (parent->case_insensitive) {
+	if (parent->caseInsensitive) {
 		for (const auto &entry : parent->lowerCaseEntries) {
 			FSNode *child = entry.second;
 			if (child->type == FSNodeType::kDirectory) {
@@ -181,14 +188,15 @@ void fs_dumpfree() {
 void xattr_dump() {
 	for (auto i = 0; i < XATTR_DATA_HASH_SIZE; i++) {
 		for (const auto &xattrDataEntry : gMetadata->xattrDataHash[i]) {
-			printf(
-			    "X|i:%10" PRIiNode "|n:%s|v:%s\n", xattrDataEntry.get()->inode,
-			    fsnodes_escape_name(std::string((char *)xattrDataEntry.get()->attributeName.data(),
+			printf("X|i:%10" PRIiNode "|n:%s|v:%s\n", xattrDataEntry.get()->inode,
+			       gFSOperations->nodeOperations()
+			           ->escapeName(std::string((char *)xattrDataEntry.get()->attributeName.data(),
 			                                    xattrDataEntry.get()->attributeName.size()))
-			        .c_str(),
-			    fsnodes_escape_name(std::string((char *)xattrDataEntry.get()->attributeValue.data(),
+			           .c_str(),
+			       gFSOperations->nodeOperations()
+			           ->escapeName(std::string((char *)xattrDataEntry.get()->attributeValue.data(),
 			                                    xattrDataEntry.get()->attributeValue.size()))
-			        .c_str());
+			           .c_str());
 		}
 	}
 }

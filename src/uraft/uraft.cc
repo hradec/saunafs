@@ -4,6 +4,8 @@
 
 #include "uraft.h"
 
+#include <syslog.h>
+
 #if defined(SAUNAFS_HAVE_GETIFADDRS)
  #include <sys/types.h>
  #include <ifaddrs.h>
@@ -26,6 +28,7 @@ uRaft::uRaft(boost::asio::io_context &ios)
 	opt_.heartbeat_period       = 20;
 	opt_.id                     = -1;
 	opt_.port                   = 9425;
+	opt_.quorum_loss_grace_heartbeats = 5;
 
 	state_.id           = 0;
 	state_.type         = kFollower;
@@ -95,52 +98,74 @@ void uRaft::checkTerm(int /*id*/, const RpcHeader &data) {
 	if (data.term > state_.current_term) {
 		if (state_.president) {
 			assert(state_.type != kFollower);
-			state_.current_term = data.term;
-			electionTimeout(boost::system::error_code());
-			return;
+			syslog(LOG_NOTICE, "(%s): Higher term detected (%lu): stepping down Leader %s",
+			       __func__, data.term, nodeToString(state_.id).c_str());
 		}
-
-		if (state_.type != kFollower) startElectionTimer();
-		state_.type         = kFollower;
-		state_.voted_for    = -1;
-		state_.current_term = data.term;
+		stepDownToFollower(StepDownPolicy::kDemoteIfPresident, data.term);
 	}
 }
 
-/*! \brief Checks if packet is valid.
+void uRaft::stepDownToFollower(StepDownPolicy policy, uint64_t newTerm) {
+	const bool wasPresident = state_.president;
+
+	if (newTerm > 0U) { state_.current_term = newTerm; }
+
+	state_.type = kFollower;
+	state_.president = false;
+	state_.voted_for = -1;
+	state_.leader_id = -1;
+
+	quorum_loss_streak_ = 0;
+
+	if (wasPresident && policy == StepDownPolicy::kDemoteIfPresident) { nodeDemote(); }
+
+	startElectionTimer();
+}
+
+/*! \brief Checks if a received packet is structurally valid.
  *
- * Packet with lower term than current is discarded by Raft algorithm. So we can consider it as
- * invalid.
+ * This function validates only the packet shape (RPC type and expected message size).
+ * It deliberately does NOT discard packets with a term lower than the local `state_.current_term`.
+ *
+ * Rationale:
+ * In Raft, a follower should respond to stale RPCs (e.g. RequestVote/AppendEntries with
+ * older terms) with `success/result = false` and include its current term in the response.
+ * This allows candidates that are behind (for example after a restart) to learn the higher
+ * term immediately, step down if needed, and catch up without waiting to increment term
+ * across many election timeouts.
+ *
+ * Dropping lower-term RPCs at the packet-validation layer can significantly increase convergence
+ * time, because it prevents the sender from observing the receiver’s higher term.
+ * This is especially noticeable where metadata servers restart and then, elections are delayed
+ * until the restarted node catches up its term via timeouts.
+ *
+ * \note Term handling is therefore performed inside the RPC handlers.
  */
 bool uRaft::validPacket(const uint8_t *data, size_t size) {
 	static unsigned packet_size[kRpcLast] = {sizeof(RpcRequest), sizeof(RpcRequest),
 	                                        sizeof(RpcResponse), sizeof(RpcResponse)
 	                                        };
 
-	if (data[0] >= kRpcLast || size != packet_size[data[0]]) {
-		return false;
-	}
-
-	return reinterpret_cast<const RpcHeader *>(data)->term >= state_.current_term;
+	return (data[0] < kRpcLast && size == packet_size[data[0]]);
 }
 
 void uRaft::startElectionTimer() {
 	int timeout = opt_.election_timeout_min +
 	              rand() % (opt_.election_timeout_max - opt_.election_timeout_min);
-	election_timer_.expires_from_now(boost::posix_time::millisec(timeout));
+	election_timer_.expires_after(std::chrono::milliseconds(timeout));
 	election_timer_.async_wait(boost::bind(&uRaft::electionTimeout, this,
 	                                       boost::asio::placeholders::error));
 }
 
 void uRaft::startHearbeatTimer() {
-	heartbeat_timer_.expires_from_now(boost::posix_time::millisec(opt_.heartbeat_period));
+	heartbeat_timer_.expires_after(std::chrono::milliseconds(opt_.heartbeat_period));
 	heartbeat_timer_.async_wait(boost::bind(&uRaft::heartbeat, this,
 	                                        boost::asio::placeholders::error));
 }
 
 void uRaft::signLoyaltyAgreement() {
 	state_.loyalty_agreement = true;
-	loyalty_agreement_timer_.expires_from_now(boost::posix_time::millisec(opt_.election_timeout_min));
+	loyalty_agreement_timer_.expires_after(std::chrono::milliseconds(opt_.election_timeout_min));
 	loyalty_agreement_timer_.async_wait([this](const boost::system::error_code & error) {
 		if (!error) {
 			state_.loyalty_agreement = false;
@@ -215,6 +240,8 @@ void uRaft::electionTimeout(const boost::system::error_code &error) {
 		startElectionTimer();
 	} else {
 		state_.type = kLeader;
+		syslog(LOG_NOTICE, "(%s): Election won with quorum: Promoting node %s to Leader", __func__,
+		       nodeToString(state_.id).c_str());
 		nodePromote();
 	}
 }
@@ -230,22 +257,40 @@ void uRaft::heartbeat(const boost::system::error_code &error) {
 	state_.local_time++;
 	node_[state_.id].heartbeat = state_.local_time;
 
+	int loyal_votes = -1;
+	bool has_quorum = false;
+
+	if (state_.type == kLeader) {
+		loyal_votes = voteCount(true);
+		has_quorum = loyal_votes >= opt_.quorum;
+	}
+
 	// Roll back from being the leader if there are less than quorum
 	// loyal nodes alive
 	if (state_.president) {
 		assert(state_.type != kFollower);
-		if (voteCount(true) < opt_.quorum) {
-			if (state_.type == kLeader) {
-				state_.type      = kFollower;
-				state_.voted_for = -1;
-				startElectionTimer();
+		if (!has_quorum) {
+			quorum_loss_streak_++;
+
+			syslog(LOG_WARNING,
+			       "(%s): Reported quorum loss: %d out of %d before demoting Leader %s", __func__,
+			       quorum_loss_streak_, opt_.quorum_loss_grace_heartbeats,
+			       nodeToString(state_.id).c_str());
+
+			if (quorum_loss_streak_ < opt_.quorum_loss_grace_heartbeats) {
+				sendHeartbeat();  // Heartbeat still needs to be sent
+				return;  // Quorum hysteresis: tolerate transient loss
 			}
-			state_.president = false;
 
-			nodeDemote();
+			syslog(LOG_WARNING,
+			       "(%s): Heartbeat quorum lost: %d out of %d nodes voted for Leader; "
+			       "demoting Leader %s to follower",
+			       __func__, loyal_votes, opt_.quorum, nodeToString(state_.id).c_str());
 
+			stepDownToFollower(StepDownPolicy::kDemoteIfPresident);
 			return;
 		}
+		quorum_loss_streak_ = 0;
 	}
 
 	if (state_.type == kCandidate) {
@@ -255,8 +300,10 @@ void uRaft::heartbeat(const boost::system::error_code &error) {
 	if (state_.type == kLeader) {
 		sendHeartbeat();
 		if (!state_.president) {
-			if (voteCount(true) >= opt_.quorum) {
+			if (has_quorum) {
 				state_.president = true;
+				syslog(LOG_NOTICE, "(%s): Heartbeat quorum confirmed: Node %s is now active Leader",
+				       __func__, nodeToString(state_.id).c_str());
 				nodePromote();
 			}
 		}
@@ -268,9 +315,31 @@ void uRaft::rpcAppend(int id, const RpcRequest &data) {
 	RpcResponse res;
 
 	assert(state_.type != kLeader);
-	assert(data.term >= state_.current_term);
 
-	if (id != state_.leader_id) {
+	// Reply false if term is older than current term, but still send current term back to the
+	// sender to let it catch up its term and step down if needed.
+	if (data.term < state_.current_term) {
+		RpcResponse res{};
+		res.type = kRpcAEResponse;
+		res.term = state_.current_term;
+		res.result = 0;
+		res.req_time = data.time;
+		res.data_version = state_.data_version;
+		socketSend(boost::asio::buffer(&res, sizeof(res)), sender_endpoint_);
+		return;
+	}
+
+	if (isElectorNode()) {
+		// Electors preserve the highest data version from the Leader in every heartbeat,
+		// as they do not have a local metadata server to fetch it from.
+		// This ensures that electors always have the latest metadata version sent by the Leader and
+		// will not vote for candidates with outdated versions.
+		state_.data_version = std::max(state_.data_version, data.data_version);
+	}
+
+	if (id != state_.leader_id && !isElectorNode()) {
+		// When the Leader changes, metadata nodes (non-electors) update their data version from
+		// their local metadata server through the nodeGetVersion() function.
 		state_.data_version = nodeGetVersion();
 	}
 
@@ -292,6 +361,9 @@ void uRaft::rpcAppend(int id, const RpcRequest &data) {
 
 /*! \brief Handling of RPC Append Response packet. */
 void uRaft::rpcAppendResponse(int id, const RpcResponse &data) {
+	// Stale response
+	if (data.term < state_.current_term) { return; }
+
 	if (state_.type != kLeader) {
 		return;
 	}
@@ -306,7 +378,10 @@ void uRaft::rpcAppendResponse(int id, const RpcResponse &data) {
 void uRaft::rpcReqVote(int id, const RpcRequest &data) {
 	RpcResponse res;
 
-	if (state_.voted_for < 0) {
+	if (state_.voted_for < 0 && !isElectorNode()) {
+		// Only metadata nodes (non-electors) update their data version from local metadata server.
+		// Electors have no local metadata server, so they preserve the highest version ever seen
+		// through heartbeats in rpcAppend().
 		state_.data_version = nodeGetVersion();
 	}
 
@@ -331,6 +406,9 @@ void uRaft::rpcReqVote(int id, const RpcRequest &data) {
 
 /*! \brief Handling of RPC Request Vote Response packet. */
 void uRaft::rpcReqVoteResponse(int id, const RpcResponse &data) {
+	// Stale response
+	if (data.term < state_.current_term) { return; }
+
 	if (state_.type != kCandidate) {
 		return;
 	}
@@ -441,12 +519,11 @@ void uRaft::demoteLeader() {
 	if (state_.type == kFollower) {
 		return;
 	}
-	state_.type      = kFollower;
-	state_.voted_for = -1;
-	state_.leader_id = -1;
-	state_.president = false;
 
-	startElectionTimer();
+	syslog(LOG_NOTICE, "(%s): Manual demotion: Stepping down Leader %s to follower", __func__,
+	       nodeToString(state_.id).c_str());
+
+	stepDownToFollower(StepDownPolicy::kRaftOnly);
 }
 
 void uRaft::set_block_promotion(bool block) {
@@ -506,4 +583,19 @@ int uRaft::scanLocalInterfaces() {
 #else
 	return -1;
 #endif
+}
+
+std::string uRaft::nodeToString(int id) {
+	if (id < 0 || id >= static_cast<int>(opt_.server.size())) {
+		return "Invalid node ID";
+	}
+
+	std::string name = opt_.server[id];
+	std::string::size_type p = name.find(":");
+
+	if (p != std::string::npos) {
+		name = name.substr(0, p);
+	}
+
+	return name;
 }

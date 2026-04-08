@@ -50,7 +50,6 @@ umask 0022
 "$script_dir/install-packages.sh"
 
 python_packages=(
-	asciidoc
 	black
 	devscripts
 	flask
@@ -115,6 +114,7 @@ if ! [[ -f /etc/sudoers.d/saunafstest ]] || \
 		ALL ALL = NOPASSWD: /bin/rm -rf /tmp/saunafs_error_dir
 		saunafstest ALL = NOPASSWD: /bin/sh -c echo\ 1\ >\ /proc/sys/vm/drop_caches
 		saunafstest ALL = NOPASSWD: /usr/bin/cat .oplog
+		saunafstest ALL = NOPASSWD: /usr/bin/tee .stats
 	END
 	chmod 0440 /etc/sudoers.d/saunafstest
 fi
@@ -191,11 +191,16 @@ if [ ! -f /etc/sudoers.d/saunafstest ] || ! grep -q '# FoundationDB' /etc/sudoer
 		# FoundationDB
 		saunafstest ALL = NOPASSWD: /usr/lib/foundationdb/fdbmonitor --conffile*
 		saunafstest ALL = NOPASSWD: /usr/bin/pkill -f fdbmonitor*
+		saunafstest ALL = NOPASSWD: /usr/bin/pkill -9 -f fdbmonitor*
 	END
 fi
 
 echo ; echo 'Install FoundationDB'
-"$script_dir/ci_build/install-foundationdb.sh"
+if grep -q Microsoft /proc/version && ! grep -q microsoft-standard /proc/version; then
+	echo "Running on WSL1: skipping FoundationDB installation."
+else
+	"$script_dir/ci_build/install-foundationdb.sh"
+fi
 
 echo ; echo 'Fixing GIDs of users'
 for name in saunafstest saunafstest_{0..9}; do

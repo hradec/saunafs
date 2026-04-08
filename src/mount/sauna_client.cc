@@ -45,11 +45,13 @@
 #include "common/access_control_list.h"
 #include "common/acl_converter.h"
 #include "common/acl_type.h"
+#include "common/args_stat_encoding.h"
 #include "common/crc.h"
 #include "common/datapack.h"
 #include "common/errno_defs.h"
 #include "common/lru_cache.h"
 #include "common/saunafs_version.h"
+#include "errors/saunafs_error_codes.h"
 #include "errors/sfserr.h"
 #include "common/richacl_converter.h"
 #include "slogger/slogger.h"
@@ -67,6 +69,7 @@
 #include "mount/mastercomm.h"
 #include "mount/masterproxy.h"
 #include "mount/mount_info.h"
+#include "mount/negative_cache.h"
 #include "mount/notification_area_logging.h"
 #include "mount/oplog.h"
 #include "mount/readdata.h"
@@ -240,7 +243,6 @@ static unsigned gDirEntryCacheMaxSize = 100000;
 
 static int debug_mode = 0;
 static int usedircache = 1;
-static std::atomic<bool> gIgnoreFlush = false;
 static std::atomic<bool> gUseQuotaInVolumeSize = false;
 static int keep_cache = 0;
 static double direntry_cache_timeout = 0.1;
@@ -345,30 +347,36 @@ void drop_readdir_session(uint64_t opendirSessionID) {
 	gReaddirSessions.erase(opendirSessionID);
 }
 
-static void updateNextReaddirEntryIndexIfMasterRestarted(ReaddirSession& readdirSession, uint64_t &nextEntryIndex,
-		Context &ctx, inode_t parentInode, uint64_t requestSize) {
-	if (!readdirSession.restarted) {
-		return;
-	}
+static uint8_t updateNextReaddirEntryIndexIfMasterRestarted(ReaddirSession &readdirSession,
+                                                            uint64_t &nextEntryIndex, Context &ctx,
+                                                            inode_t parentInode,
+                                                            uint64_t requestSize) {
+	if (!readdirSession.restarted) { return SAUNAFS_STATUS_OK; }
 	std::vector<DirectoryEntry> dirEntries;
 	uint8_t status = 0;
 	nextEntryIndex = 0;
+
+	if (readdirSession.lastReadIno == 0) {
+		readdirSession.restarted = false;
+		return SAUNAFS_STATUS_OK;
+	}
+
 	while (true) {
 		dirEntries.clear();
 		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(
-			status, ctx,
-			fs_getdir(parentInode, ctx.uid, ctx.gid, nextEntryIndex, requestSize, dirEntries)
-		);
-		if (dirEntries.empty()) {
-			break;
+		    status, ctx,
+		    fs_getdir(parentInode, ctx.uid, ctx.gid, nextEntryIndex, requestSize, dirEntries));
+
+		if (status != SAUNAFS_STATUS_OK) {
+			readdirSession.restarted = false;
+			return status;
 		}
+
+		if (dirEntries.empty()) { break; }
 		std::vector<DirectoryEntry>::const_iterator direntIt = find_if(
-				dirEntries.cbegin(),
-				dirEntries.cend(),
-				[&readdirSession](DirectoryEntry const& de) {
-					return (de.inode == readdirSession.lastReadIno);
-				}
-			);
+		    dirEntries.cbegin(), dirEntries.cend(), [&readdirSession](DirectoryEntry const &de) {
+			    return (de.inode == readdirSession.lastReadIno);
+		    });
 		if (direntIt != dirEntries.end()) {
 			nextEntryIndex = direntIt->index;
 			dirEntries.clear();
@@ -376,7 +384,9 @@ static void updateNextReaddirEntryIndexIfMasterRestarted(ReaddirSession& readdir
 		}
 		nextEntryIndex = dirEntries.back().next_index;
 	}
+
 	readdirSession.restarted = false;
+	return SAUNAFS_STATUS_OK;
 }
 
 void masterDisconnectedCallback() {
@@ -886,141 +896,151 @@ void access(Context &ctx, inode_t ino, int mask) {
 }
 
 EntryParam lookup(Context &ctx, inode_t parent, const char *name) {
-	EntryParam e;
-	uint64_t maxfleng;
-	inode_t inode;
-	uint32_t nleng;
-	Attributes attr;
-	char attrstr[256];
-	uint8_t mattr;
-	uint8_t icacheflag;
-	int status;
+	if (gNegativeCache.lookup(parent, name)) {
+		if (debug_mode) {
+			safs::log_debug("lookup: ({},{}) negative cache hit, skipping master lookup",
+							parent, name);
+		}
+		// Negative cache hit, early return
+		// Kernel may cache negative entries for entry_timeout seconds
+		EntryParam e{};
+		e.ino = 0;
+		e.entry_timeout = NegativeCache::getGlobalTimeoutMs() / 1000.0;
+		return e;
+	}
 
 	if (debug_mode) {
 #ifdef _WIN32
-		if (parent != SPECIAL_INODE_ROOT ||
-		    strcmp(name, SPECIAL_FILE_NAME_OPLOG) != 0) {
+		if (parent != SPECIAL_INODE_ROOT || strcmp(name, SPECIAL_FILE_NAME_OPLOG) != 0) {
 			oplog_printf(ctx, "lookup (%" PRIiNode ",%s) ...", parent, name);
 		}
 #else
 		oplog_printf(ctx, "lookup (%" PRIiNode ",%s) ...", parent, name);
 #endif
 	}
-	nleng = strlen(name);
-	if (nleng > SFS_NAME_MAX) {
+
+	uint32_t nameLen = strlen(name);
+	if (nameLen > SFS_NAME_MAX) {
 		stats_inc(OP_LOOKUP);
-		oplog_printf(ctx, "lookup (%" PRIiNode ",%s): %s", parent, name, saunafs_error_string(SAUNAFS_ERROR_ENAMETOOLONG));
+		oplog_printf(ctx, "lookup (%" PRIiNode ",%s): %s", parent, name,
+		             saunafs_error_string(SAUNAFS_ERROR_ENAMETOOLONG));
 		throw RequestException(SAUNAFS_ERROR_ENAMETOOLONG);
 	}
+
+	constexpr uint32_t kAttrStrSize = 256;
+	char attrStr[kAttrStrSize];
 	if (parent == SPECIAL_INODE_ROOT) {
-		if (nleng == 2 && name[0] == '.' && name[1] == '.') {
-			nleng = 1;
+		if (std::string_view(name, nameLen) == "..") {
+			nameLen = 1;
 		}
 
-		inode_t ino = getSpecialInodeByName(name);
-		if (IS_SPECIAL_INODE(ino)) {
-			return special_lookup(ino, ctx, parent, name, attrstr);
+		inode_t inode = getSpecialInodeByName(name);
+		if (IS_SPECIAL_INODE(inode)) { 
+			return special_lookup(inode, ctx, parent, name, attrStr);
 		}
 	}
+
+	inode_t inode;
+	Attributes attr;
+	bool cacheHit = false;
+	int status;
 	if (parent == SPECIAL_INODE_FILE_BY_INODE) {
-		char *endptr = nullptr;
-		inode = strtol(name, &endptr, 10);
-		if (endptr == nullptr || *endptr != '\0') {
+		char *endPtr = nullptr;
+		inode = strtol(name, &endPtr, 10);
+		if (endPtr == nullptr || *endPtr != '\0') {
 			throw RequestException(SAUNAFS_ERROR_EINVAL);
 		}
 		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx,
 			fs_getattr(inode, ctx.uid, ctx.gid, attr));
-		icacheflag = 0;
 	} else if (parent == SPECIAL_INODE_PATH_BY_INODE) {
-		char *endptr = nullptr;
-		inode = strtol(name, &endptr, 10);
-		if (endptr == nullptr || *endptr != '\0') {
+		char *endPtr = nullptr;
+		inode = strtol(name, &endPtr, 10);
+		if (endPtr == nullptr || *endPtr != '\0') {
 			throw RequestException(SAUNAFS_ERROR_EINVAL);
 		}
 		std::unique_lock<std::mutex> lock(gInodePathInfo.mtx);
-		gInodePathInfo.cv.wait(lock, [inode] {
-			return !gInodePathInfo.locked ||
-			       gInodePathInfo.inode == inode;
-		});
-		gInodePathInfo.locked = true;
-		gInodePathInfo.inode = inode;
-		std::string fullPath = "";
+		std::string fullPath;
 		int lookupStatus = SAUNAFS_STATUS_OK;
 		int getattrStatus = SAUNAFS_STATUS_OK;
 		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(lookupStatus, ctx,
-		fs_fullpath(inode, ctx.uid, ctx.gid, fullPath));
+			fs_fullpath(inode, ctx.uid, ctx.gid, fullPath));
 		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(getattrStatus, ctx,
 			fs_getattr(inode, ctx.uid, ctx.gid, attr));
 		if (lookupStatus != SAUNAFS_STATUS_OK || getattrStatus != SAUNAFS_STATUS_OK) {
-			status = lookupStatus != SAUNAFS_STATUS_OK ? lookupStatus : getattrStatus;
-			gInodePathInfo.locked = false;
-			gInodePathInfo.cv.notify_one();
+			status = (lookupStatus != SAUNAFS_STATUS_OK) ? lookupStatus : getattrStatus;
 			lock.unlock();
 			throw RequestException(status);
 		}
 		status = SAUNAFS_STATUS_OK;
-		gInodePathInfo.pathByInode = fullPath;
+		if (ctx.pid > 0) {
+			PidPathEntry entry{ .pid = ctx.pid, .path = fullPath };
+			gInodePathInfo.contextPidToPath[entry]++;
+		}
 		attr[0] = TYPE_FILE;
 		inode = parent;
-		icacheflag = 0;
-	} else if (usedircache && gDirEntryCache.lookup(ctx,parent,std::string(name,nleng),inode,attr)) {
-		if (debug_mode) {
-			safs::log_debug("lookup: sending data from dircache");
-		}
+	} else if (usedircache &&
+	           gDirEntryCache.lookup(ctx, parent, std::string(name, nameLen), inode, attr)) {
+		if (debug_mode) { safs::log_debug("lookup: sending data from dircache"); }
 		stats_inc(OP_DIRCACHE_LOOKUP);
-		status = 0;
-		icacheflag = 1;
-	} else {
+		status = SAUNAFS_STATUS_OK;
+		cacheHit = true;
+	} else {  // dentry miss
 		stats_inc(OP_LOOKUP);
 		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx,
-		fs_lookup(parent, std::string(name, nleng), ctx.uid, ctx.gid, &inode, attr));
-		icacheflag = 0;
+			fs_lookup(parent, std::string(name, nameLen), ctx.uid, ctx.gid, &inode, attr));
 	}
 	if (status != SAUNAFS_STATUS_OK) {
-		oplog_printf(ctx, "lookup (%" PRIiNode ",%s): %s", parent, name, saunafs_error_string(status));
+		oplog_printf(ctx, "lookup (%" PRIiNode ",%s): %s", parent, name,
+		             saunafs_error_string(status));
+
+		// Negative cache entry miss, adding to negative cache, return early
+		// Kernel may cache negative entries for entry_timeout seconds
+		if (status == SAUNAFS_ERROR_ENOENT && gNegativeCache.isMaxSizeAndTimeoutMsSet()) {
+			gNegativeCache.add(parent, name);
+			EntryParam e{};
+			e.ino = 0;
+			e.entry_timeout = NegativeCache::getGlobalTimeoutMs() / 1000.0;
+			return e;
+		}
 		throw RequestException(status);
 	}
-	if (attr[0]==TYPE_FILE) {
-		maxfleng = write_data_getmaxfleng(inode);
-	} else {
-		maxfleng = 0;
-	}
+	uint64_t maxFileLen =
+	    (attr[0] == TYPE_FILE) ? WriteAlgorithm::write_data_getmaxfleng(inode) : 0;
+	EntryParam e;
 	e.ino = inode;
-	mattr = attr_get_mattr(attr);
-	e.attr_timeout = (mattr&MATTR_NOACACHE)?0.0:attr_cache_timeout;
-	e.entry_timeout = (mattr&MATTR_NOECACHE)?0.0:((attr[0]==TYPE_DIRECTORY)?direntry_cache_timeout:entry_cache_timeout);
-	attr_to_stat(inode,attr,&e.attr);
-	if (maxfleng>(uint64_t)(e.attr.st_size)) {
-		update_attr_size(attr, maxfleng);
-		e.attr.st_size=maxfleng;
+	uint8_t modeAttr = attr_get_mattr(attr);
+	e.attr_timeout = (modeAttr & MATTR_NOACACHE) ? 0.0 : attr_cache_timeout;
+	if (modeAttr & MATTR_NOECACHE) {
+		e.entry_timeout = 0.0;
+	} else {
+		e.entry_timeout =
+		    (attr[0] == TYPE_DIRECTORY) ? direntry_cache_timeout : entry_cache_timeout;
+	}
+	attr_to_stat(inode, attr, &e.attr);
+	if (maxFileLen > static_cast<uint64_t>(e.attr.st_size)) {
+		update_attr_size(attr, maxFileLen);
+		e.attr.st_size = static_cast<off_t>(maxFileLen);
 	}
 
 	// If lookup succeeded and data did not come from cache, then cache it.
-	// Files with at least one hardlink are impossible to keep track of, so it is
-	// better to don't track them.
-	if (!icacheflag && !(e.attr.st_nlink > 1 && attr[0] == TYPE_FILE)) {
-		auto data_acquire_time = gDirEntryCache.updateTime();
-
+	// Files with at least one hardlink are impossible to keep track of, so better not track them.
+	if (!cacheHit && (attr[0] != TYPE_FILE || e.attr.st_nlink <= 1)) {
 		std::unique_lock<shared_mutex> write_guard(gDirEntryCache.rwlock());
-		gDirEntryCache.updateTime();
-
-		gDirEntryCache.insert(ctx, parent, e.ino, std::string(name), attr,
-		                      data_acquire_time);
+		uint64_t data_acquire_time = gDirEntryCache.updateTime();
+		gDirEntryCache.insert(ctx, parent, e.ino, std::string(name), attr, data_acquire_time);
 		if (gDirEntryCache.size() > gDirEntryCacheMaxSize) {
-			gDirEntryCache.removeOldest(gDirEntryCache.size() -
-			                            gDirEntryCacheMaxSize);
+			gDirEntryCache.removeOldest(gDirEntryCache.size() - gDirEntryCacheMaxSize);
 		}
 	}
-
-	makeattrstr(attrstr,256,&e.attr);
+	makeattrstr(attrStr, kAttrStrSize, &e.attr);
 	oplog_printf(ctx, "lookup (%" PRIiNode ",%s)%s: OK (%.1f,%" PRIiNode ",%.1f,%s)",
 			parent,
 			name,
-			icacheflag?" (using open dir cache)":"",
+			cacheHit ? " (using open dir cache)" : "",
 			e.entry_timeout,
 			e.ino,
 			e.attr_timeout,
-			attrstr);
+			attrStr);
 	return e;
 }
 
@@ -1067,7 +1087,7 @@ AttrReply getattr(Context &ctx, inode_t ino) {
 		throw RequestException(status);
 	}
 
-	maxfleng = write_data_getmaxfleng(ino);
+	maxfleng = WriteAlgorithm::write_data_getmaxfleng(ino);
 	memset(&o_stbuf, 0, sizeof(struct stat));
 	attr_to_stat(ino,attr,&o_stbuf);
 	if (attr[0]==TYPE_FILE && maxfleng>(uint64_t)(o_stbuf.st_size)) {
@@ -1133,7 +1153,7 @@ AttrReply setattr(Context &ctx, inode_t ino, struct stat *stbuf, int to_set) {
 	}
 
 	status = SAUNAFS_ERROR_EINVAL;
-	maxfleng = write_data_getmaxfleng(ino);
+	maxfleng = WriteAlgorithm::write_data_getmaxfleng(ino);
 	if ((to_set & (SAUNAFS_SET_ATTR_MODE
 			| SAUNAFS_SET_ATTR_UID
 			| SAUNAFS_SET_ATTR_GID
@@ -1190,7 +1210,7 @@ AttrReply setattr(Context &ctx, inode_t ino, struct stat *stbuf, int to_set) {
 		}
 		if (to_set & (SAUNAFS_SET_ATTR_MTIME | SAUNAFS_SET_ATTR_MTIME_NOW)) {
 			// in this case we want flush all pending writes because they could overwrite mtime
-			write_data_flush_inode(ino);
+			WriteAlgorithm::write_data_flush_inode(ino);
 		}
 		RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx,
 		fs_setattr(ino,ctx.uid,ctx.gid,setmask,stbuf->st_mode&07777,stbuf->st_uid,stbuf->st_gid,stbuf->st_atime,stbuf->st_mtime,sugid_clear_mode,attr));
@@ -1242,8 +1262,10 @@ AttrReply setattr(Context &ctx, inode_t ino, struct stat *stbuf, int to_set) {
 			throw RequestException(SAUNAFS_ERROR_EFBIG);
 		}
 		try {
-			RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx,
-				write_data_truncate(ino, false, ctx.uid, ctx.gid, stbuf->st_size, attr));
+			RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(
+			    status, ctx,
+			    WriteAlgorithm::write_data_truncate(ino, false, ctx.uid, ctx.gid, stbuf->st_size,
+			                                        attr));
 			maxfleng = 0; // after the flush master server has valid length, don't use our length cache
 		} catch (Exception& ex) {
 			status = ex.status();
@@ -1944,13 +1966,16 @@ std::vector<DirEntry> readdir(Context &ctx, uint64_t fh, inode_t ino, off_t off,
 	};
 
 	do {
-		updateNextReaddirEntryIndexIfMasterRestarted(*readdirSession, entry_index, ctx, ino, request_size);
+		status = updateNextReaddirEntryIndexIfMasterRestarted(*readdirSession, entry_index, ctx,
+		                                                      ino, request_size);
+
+		if (status != SAUNAFS_STATUS_OK) { break; }
+
 		clearDirEntries(__LINE__);
 		status = fs_getdir(ino, ctx.uid, ctx.gid, entry_index, request_size, dir_entries);
 
 		if (status == SAUNAFS_ERROR_GROUPNOTREGISTERED) {
 			registerGroupsInMaster(ctx);
-			updateNextReaddirEntryIndexIfMasterRestarted(*readdirSession, entry_index, ctx, ino, request_size);
 			clearDirEntries(__LINE__);
 			status = fs_getdir(ino, ctx.uid, ctx.gid, entry_index, request_size, dir_entries);
 		}
@@ -2092,7 +2117,7 @@ static finfo* fs_newfileinfo(uint8_t accmode, inode_t inode) {
 		fileinfo->data = static_cast<void *>(read_data_new(inode));
 	} else if (accmode == O_WRONLY) {
 		fileinfo->mode = IO_WRITEONLY;
-		fileinfo->data = write_data_new(inode);
+		fileinfo->data = WriteAlgorithm::write_data_new(inode);
 	} else {
 		fileinfo->mode = IO_NONE;
 		fileinfo->data = NULL;
@@ -2112,7 +2137,7 @@ void remove_file_info(FileInfo *f) {
 	if (fileinfo->mode == IO_READONLY || fileinfo->mode == IO_READ) {
 		read_data_end(static_cast<ReadRecord *>(fileinfo->data));
 	} else if (fileinfo->mode == IO_WRITEONLY || fileinfo->mode == IO_WRITE) {
-		write_data_end(fileinfo->data);
+		WriteAlgorithm::write_data_end(fileinfo->data);
 	}
 	lock.unlock(); // This unlock is needed, since we want to destroy the mutex
 	pthread_mutex_destroy(fileinfo->lock.native_handle()); // Make helgrind happy
@@ -2399,7 +2424,7 @@ ReadCache::Result read(Context &ctx,
 		throw RequestException(SAUNAFS_ERROR_EACCES);
 	}
 	if (fileinfo->mode==IO_WRITE) {
-		err = write_data_flush(fileinfo->data);
+		err = WriteAlgorithm::write_data_flush(fileinfo->data);
 		if (err != SAUNAFS_STATUS_OK) {
 			oplog_printf(ctx, "read (%" PRIiNode ",%" PRIu64 ",%" PRIu64 "): %s",
 					ino,
@@ -2408,7 +2433,7 @@ ReadCache::Result read(Context &ctx,
 					saunafs_error_string(err));
 			throw RequestException(err);
 		}
-		write_data_end(fileinfo->data);
+		WriteAlgorithm::write_data_end(fileinfo->data);
 	}
 	if (fileinfo->mode==IO_WRITE || fileinfo->mode==IO_NONE) {
 		fileinfo->mode = IO_READ;
@@ -2417,7 +2442,7 @@ ReadCache::Result read(Context &ctx,
 	// end of reader critical section
 	flushlock.unlock();
 
-	write_data_flush_inode(ino);
+	WriteAlgorithm::write_data_flush_inode(ino);
 
 	uint64_t firstBlockToRead = off / SFSBLOCKSIZE;
 	uint64_t firstBlockNotToRead = (off + size + SFSBLOCKSIZE - 1) / SFSBLOCKSIZE;
@@ -2521,7 +2546,7 @@ BytesWritten write(Context &ctx, inode_t ino, const char *buf, size_t size, off_
 	}
 	if (fileinfo->mode==IO_READ || fileinfo->mode==IO_NONE) {
 		fileinfo->mode = IO_WRITE;
-		fileinfo->data = write_data_new(ino);
+		fileinfo->data = WriteAlgorithm::write_data_new(ino);
 	}
 
 	Attributes attr;
@@ -2533,8 +2558,7 @@ BytesWritten write(Context &ctx, inode_t ino, const char *buf, size_t size, off_
 	attr_to_stat(ino, attr, &stbuf);
 	size_t currentSize = stbuf.st_size;
 
-	err = write_data(fileinfo->data, off, size, (const uint8_t *)buf,
-	                 currentSize);
+	err = WriteAlgorithm::write_data(fileinfo->data, off, size, (const uint8_t *)buf, currentSize);
 	gDirEntryCache.lockAndInvalidateInode(ino);
 	if (err != SAUNAFS_STATUS_OK) {
 		oplog_printf(ctx, "write (%" PRIiNode ",%" PRIu64 ",%" PRIu64 "): (physical) %s",
@@ -2554,12 +2578,6 @@ BytesWritten write(Context &ctx, inode_t ino, const char *buf, size_t size, off_
 }
 
 void flush(Context &ctx, inode_t ino, FileInfo* fi) {
-	if (gIgnoreFlush) {
-		oplog_printf(ctx, "flush (%" PRIiNode "): OK",
-				ino);
-		return;
-	}
-
 	finfo *fileinfo = reinterpret_cast<finfo*>(fi->fh);
 	int err;
 
@@ -2583,7 +2601,7 @@ void flush(Context &ctx, inode_t ino, FileInfo* fi) {
 	err = SAUNAFS_STATUS_OK;
 	std::unique_lock lock(fileinfo->lock);
 	if (fileinfo->mode==IO_WRITE || fileinfo->mode==IO_WRITEONLY) {
-		err = write_data_flush(fileinfo->data);
+		err = WriteAlgorithm::write_data_flush(fileinfo->data);
 	}
 	safs_locks::FlockWrapper file_lock(safs_locks::kRelease,0,0,0);
 	auto use_posixlocks = fileinfo->use_posixlocks;
@@ -2628,7 +2646,7 @@ void fsync(Context &ctx, inode_t ino, int datasync, FileInfo* fi) {
 	err = SAUNAFS_STATUS_OK;
 	std::lock_guard lock(fileinfo->lock);
 	if (fileinfo->mode==IO_WRITE || fileinfo->mode==IO_WRITEONLY) {
-		err = write_data_flush(fileinfo->data);
+		err = WriteAlgorithm::write_data_flush(fileinfo->data);
 	}
 	if (err != SAUNAFS_STATUS_OK) {
 		oplog_printf(ctx, "fsync (%" PRIiNode ",%d): %s",
@@ -3186,7 +3204,7 @@ XattrReply getxattr(Context &ctx, inode_t ino, const char *name, size_t size, ui
 		mode = XATTR_GMODE_GET_DATA;
 	}
 	(void)position;
-	status = choose_xattr_handler(name)->getxattr(ctx, ino, name, nleng, mode, leng, buffer);
+	RETRY_ON_ERROR_WITH_UPDATED_CREDENTIALS(status, ctx, choose_xattr_handler(name)->getxattr(ctx, ino, name, nleng, mode, leng, buffer)) 
 	buff = buffer.data();
 	if (status != SAUNAFS_STATUS_OK) {
 		oplog_printf(ctx, "getxattr (%" PRIiNode ",%s,%" PRIu64 "): %s",
@@ -3547,30 +3565,37 @@ std::vector<ChunkserverListEntry> getchunkservers() {
 }
 
 void init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_, unsigned direntry_cache_size_,
+		unsigned negative_cache_timeout_, unsigned negative_cache_size_,
 		double entry_cache_timeout_, double attr_cache_timeout_, int mkdir_copy_sgid_,
 		SugidClearMode sugid_clear_mode_, bool use_rwlock_,
 		double acl_cache_timeout_, unsigned acl_cache_size_, bool direct_io,
 #ifdef _WIN32
 		int mounting_uid_, int mounting_gid_, std::unordered_set<uint32_t> &allowed_users_,
-		bool ignore_utimens_update_,
+		bool ignore_utimens_update_, unsigned acquired_files_cleanup_period_,
+		unsigned acquired_files_cleanup_timeout_,
 #endif
 #ifdef __linux__
 		unsigned malloc_trim_period_,
 #endif
-		bool ignore_flush_, unsigned statfs_cache_timeout_, bool use_quota_in_volume_size_
+		unsigned statfs_cache_timeout_, bool use_quota_in_volume_size_
 		) {
 #ifdef _WIN32
 	mounting_uid = mounting_uid_;
 	mounting_gid = mounting_gid_;
 	allowed_users = allowed_users_;
 	gIgnoreUtimensUpdate = ignore_utimens_update_;
+	gCleanAcquiredFilesPeriod = acquired_files_cleanup_period_;
+	gCleanAcquiredFilesTimeout = acquired_files_cleanup_timeout_;
 #endif
-	gIgnoreFlush = ignore_flush_;
 	gStatfsCacheTimeout = statfs_cache_timeout_;
 	gUseQuotaInVolumeSize = use_quota_in_volume_size_;
 	debug_mode = debug_mode_;
 	keep_cache = keep_cache_;
 	direntry_cache_timeout = direntry_cache_timeout_;
+	NegativeCache::setGlobalTimeoutMs(negative_cache_timeout_);
+	gNegativeCache.setTimeoutMs(NegativeCache::getGlobalTimeoutMs());
+	NegativeCache::setGlobalMaxSize(negative_cache_size_);
+	gNegativeCache.setMaxSize(NegativeCache::getGlobalMaxSize());
 	entry_cache_timeout = entry_cache_timeout_;
 	attr_cache_timeout = attr_cache_timeout_;
 	mkdir_copy_sgid = mkdir_copy_sgid_;
@@ -3606,11 +3631,16 @@ void init(int debug_mode_, int keep_cache_, double direntry_cache_timeout_, unsi
 
 	std::lock_guard lock(gMountInfoMtx);
 	gTweaks.registerVariable("DirectIO", gDirectIo, "sfsdirectio");
-	gTweaks.registerVariable("IgnoreFlush", gIgnoreFlush, "sfsignoreflush");
+	gTweaks.registerVariable("NegativeCacheTimeout", gNegativeCacheTimeoutMs, "sfsnegativecachetimeout");
+	gTweaks.registerVariable("NegativeCacheMaxSize", gNegativeCacheMaxSize, "sfsnegativecachesize");
 	gTweaks.registerVariable("StatfsCacheTimeout", gStatfsCacheTimeout, "statfscachetimeout");
 	gTweaks.registerVariable("UseQuotaInVolumeSize", gUseQuotaInVolumeSize, "usequotainvolumesize");
 #ifdef _WIN32
 	gTweaks.registerVariable("IgnoreUtimens", gIgnoreUtimensUpdate, "sfsignoreutimensupdate");
+	gTweaks.registerVariable("AcquiredFilesCleanupPeriod", gCleanAcquiredFilesPeriod,
+	                         "sfscleanacquiredfilesperiod");
+	gTweaks.registerVariable("AcquiredFilesCleanupTimeout", gCleanAcquiredFilesTimeout,
+	                         "sfscleanacquiredfilestimeout");
 #endif
 	gTweaks.registerVariable("AclCacheMaxTime", acl_cache->maxTime_ms, "aclcacheto");
 	gTweaks.registerVariable("AclCacheHit", acl_cache->cacheHit);
@@ -3632,6 +3662,15 @@ void fs_init(FsInitParams &params) {
 		throw std::runtime_error("Can't initialize connection with master server");
 	}
 	symlink_cache_init(params.symlink_cache_timeout_s);
+
+	{
+		std::unique_lock ioLimitsLock(gIOLimitsConfigFilePathMutex);
+		gIOLimitsConfigFilePath = params.io_limits_config_file;
+		ioLimitsLock.unlock();
+		gTweaks.registerVariable("IOLimitsFilePath", gIOLimitsConfigFilePath,
+		                         gIOLimitsConfigFilePathMutex, "sfsiolimits");
+	}
+
 	gGlobalIoLimiter();
 	fs_init_threads(params.io_retries, params.max_wait_retry_time,
 	                params.mastercomm_sleep_time_divisor);
@@ -3639,25 +3678,8 @@ void fs_init(FsInitParams &params) {
 
 	gLocalIoLimiter();
 	try {
-		IoLimitsConfigLoader loader;
-		if (!params.io_limits_config_file.empty()) {
-			std::ifstream ifs(params.io_limits_config_file);
-			if (!ifs.is_open()) {
-				const char *strError = std::strerror(errno);
-				safs::log_warn(
-				    "fs_init: cannot open I/O limits configuration file '{}': {}; using master-provided limits if available, otherwise no client-side limiting.",
-				    params.io_limits_config_file.c_str(), strError);
-			} else {
-				try {
-					loader.load(std::move(ifs));
-				} catch (const Exception &ex) {
-					safs::log_warn(
-					    "fs_init: failed to parse I/O limits configuration file '{}': {}; using master-provided limits if available, otherwise no client-side limiting.",
-					    params.io_limits_config_file.c_str(), ex.what());
-				}
-			}
-		}
-		gMountLimiter().loadConfiguration(loader);
+		fsLoadMountIoLimits();
+		gIOLimitsInitialized = true;
 	} catch (Exception &ex) {
 		safs_pretty_syslog(LOG_ERR, "Can't initialize I/O limiting: %s", ex.what());
 		masterproxy_term();
@@ -3681,6 +3703,10 @@ void fs_init(FsInitParams &params) {
 			params.prefetch_xor_stripes,
 			std::max(params.bandwidth_overuse, 1.));
 
+	WriteAlgorithm::write_data_init(
+	    params.write_cache_size, params.io_retries, params.write_workers, params.write_window_size,
+	    params.chunkserver_write_timeout_ms, params.cache_per_inode_percentage,
+	    params.write_wave_timeout_ms, params.max_chunks_written_in_parallel_per_inode);
 #ifdef _WIN32
 	set_debug_mode(params.debug_mode);
 #endif
@@ -3704,22 +3730,24 @@ void fs_init(FsInitParams &params) {
 	);
 
 	init(params.debug_mode, params.keep_cache, params.direntry_cache_timeout, params.direntry_cache_size,
+		params.negative_cache_timeout, params.negative_cache_size,
 		params.entry_cache_timeout, params.attr_cache_timeout, params.mkdir_copy_sgid,
 		params.sugid_clear_mode, params.use_rw_lock,
 		params.acl_cache_timeout, params.acl_cache_size, params.direct_io,
 #ifdef _WIN32
 		params.mounting_uid, params.mounting_gid, params.allowed_users,
-		params.ignore_utimens_update,
+		params.ignore_utimens_update, params.clean_acquired_files_period,
+		params.clean_acquired_files_timeout,
 #endif
 #ifdef __linux__
 		params.malloc_trim_period,
 #endif
-		params.ignore_flush, params.statfs_cache_timeout, params.use_quota_in_volume_size
+		params.statfs_cache_timeout, params.use_quota_in_volume_size
 		);
 }
 
 void fs_term() {
-	write_data_term();
+	WriteAlgorithm::write_data_term();
 	read_data_term();
 	masterproxy_term();
 	::fs_term();

@@ -156,12 +156,19 @@
 # MAX_BLOCKS_PER_HDD_WRITE_JOB = 16
 
 ## Maximum number of blocks read from the device in a single read job. If possible,
-## will try to make a single pread call. (Default: 8, Minimum: 1)
-# MAX_BLOCKS_PER_HDD_READ_JOB = 8
+## will try to make a single pread call. (Default: 16, Minimum: 1)
+# MAX_BLOCKS_PER_HDD_READ_JOB = 16
 
 ## Maximum number of read jobs processed in parallel per client connection.
-## (Default: 16)
-# MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY = 16
+## (Default: 1)
+# MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY = 1
+
+## Maximum size of the buffers pool used for read, write and replicate operations,
+## in megabytes. Consider decreasing it if the system is running out of memory, or
+## increasing it to improve performance if there is enough memory available. Unused
+## buffers are regularly freed.
+## (Default: 512)
+# MAX_BUFFERS_POOL_SIZE_MB = 512
 
 ## additional number of kilobytes which should be passed to
 ## posix_fadvise(POSIX_FADV_WILLNEED) before reading data from a chunk
@@ -221,7 +228,14 @@
 ## 'off'
 # LOG_LEVEL = info
 
-##### EXPERIMENTAL:
+## Directory to search for Chunkserver plugins (absolute path).
+## When set, the plugin manager will search this directory first.
+## If not set, then it will search in usual plugin locations, like:
+## /usr/local/lib/saunafs/plugins/chunkserver
+## @PLUGINS_PATH@/chunkserver (defined at build time)
+## /usr/lib/saunafs/plugins/chunkserver
+## (Default: empty string - disabled)
+# PLUGINS_DIR = ""
 
 ## Enables or disables the chunk trash feature. When enabled, deleted chunks are
 ## moved to a trash directory instead of being immediately removed. (Default: 0)
@@ -237,11 +251,55 @@
 ## the capacity of the smaller configured disk. (Default: 0)
 # CHUNK_TRASH_FREE_SPACE_THRESHOLD_GB = 0
 
-## Defines the bulk size for the garbage collector when processing chunks in the
-## trash. This determines how many files are processed in each garbage
-## collection cycle. (Default: 1000)
-# CHUNK_TRASH_GC_BATCH_SIZE = 1000
+## Defines the maximum bulk size per disk for the garbage 
+## collector when processing chunks in the trash. 
+## This value is used when no I/O pressure is detected and is dynamically 
+## scaled down based on current disk load. (Default: 500)
+# CHUNK_TRASH_GC_BATCH_SIZE = 500
 
 ## [ADVANCED] The number of files to remove from the trash in a single GC cycle,
 ## in case the disk is full and space needs to be recovered. (Default: 100)
 # CHUNK_TRASH_GC_SPACE_RECOVERY_BATCH_SIZE = 100
+
+## The number of workers purging files in parallel. (Default: 5)
+# CHUNK_TRASH_GC_PURGE_WORKERS_NR = 5
+
+##### EXPERIMENTAL:
+
+## Path to the TLS certificate file the chunk server will use for TLS connections.
+## Example: /etc/saunafs/ssl/cs.crt
+## (There is no default)
+# TLS_CERT_FILE =
+
+## Path to the TLS private key file the chunk server will use for TLS connections.
+## Example: /etc/saunafs/ssl/cs.key
+## (There is no default)
+# TLS_KEY_FILE =
+
+## Path to the trusted CA certificate file which is used to authenticate
+## to master server.
+## Example: /etc/saunafs/ssl/ca.crt
+## (There is no default)
+# TLS_CA_CERT_FILE =
+
+## Define IO jobs, i.e reads and writes from drives, prioritization scheme.
+## The available modes are:
+## - 'FIFO': prioritizes the IO jobs first enqueued.
+## - 'SWITCH': alternates read and write jobs (interleaving) to prevent one class of IO from
+##   starving the other.
+## Not reloadable.
+# IO_PRIORITY_MODE = FIFO
+
+## Caps the amount of data in MiB the chunkserver "buffers", i.e fast replies to the
+## client as if it was synced to the drives but it was only read from network and
+## stored in memory. Similar to page cache. This feature has the following constraints:
+## - does not work on standard (replica) chunks.
+## - must have chunkserver side chunk locking enabled (see
+## USE_CHUNKSERVER_SIDE_CHUNK_LOCK in master config).
+## It is also suggested to set the IO_PRIORITY_MODE to SWITCH. The PERFORM_FSYNC
+## continues working as intended, as it affects the time spent closing of the
+## written chunk.
+## Can provide better results for writes in general, but may significantly improve
+## performance for small files.
+## Reloadable.
+# WRITE_BUFFERING_SIZE_MB = 0

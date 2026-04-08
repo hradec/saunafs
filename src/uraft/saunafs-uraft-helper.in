@@ -174,7 +174,10 @@ saunafs_promote() {
 		log "metadata is on disk instead of ram"
 		saunafs_master stop
 		unlink "${METADATA_LOCK}"
-		saunafs_master -o initial-personality=master -o auto-recovery restart
+		saunafs_master -o initial-personality=master \
+					-o auto-recovery \
+					-o defer-metadata-dump \
+					restart
 		if [[ $? != 0 ]]; then
 			log "promotion to master failed"
 			exit $SAUNAFS_URAFT_ERROR
@@ -191,6 +194,28 @@ saunafs_demote() {
 	saunafs_drop_ip
 	# restart shadow
 	saunafs_master -o initial-personality=shadow restart
+}
+
+saunafs_cleanup_dirty_state() {
+	load_config
+
+	log "Attempting to clean up dirty metadata state"
+
+	# Remove temporary metadata file created during metadata dump, if it exists
+	if [[ -f "${SAUNAFS_DATA_DIR}/metadata.sfs.tmp" ]]; then
+		# Check if temporary metadata file is stale (no process holding it).
+		# This could represent a leftover from a crashed operation during metadata dump.
+		if ! fuser "${SAUNAFS_DATA_DIR}/metadata.sfs.tmp" &>/dev/null; then
+			log "Removing ${SAUNAFS_DATA_DIR}/metadata.sfs.tmp"
+			rm -f "${SAUNAFS_DATA_DIR}/metadata.sfs.tmp" || {
+				log "Failed to remove metadata.sfs.tmp"
+				return $SAUNAFS_URAFT_ERROR
+			}
+		fi
+	fi
+
+	log "Cleanup dirty metadata completed successfully"
+	return $SAUNAFS_URAFT_OK
 }
 
 saunafs_quick_stop() {
@@ -274,25 +299,61 @@ saunafs_isalive() {
 	fi
 }
 
+assign_floating_ip() {
+	local ip="${1}"
+	local netmask="${2}"
+	local iface="${3}"
+
+	if [[ -z "${ip}" ]]; then
+		return 0
+	fi
+
+	if is_ip_present "${ip}" "${iface}"; then
+		log "Floating IP ${ip} already present on interface: ${iface} - skipping assignment"
+		return 0
+	fi
+
+	log "Assigning floating IP: ${ip} to interface: ${iface}"
+	if sudo ip -f inet addr add "${ip}/${netmask}" dev "${iface}"; then
+		local iface_base="${iface%%:*}" # handle interface aliases (e.g., eth0:0 -> eth0)
+		arping -q -U -c5 -w1 "${ip}" -I "${iface_base}"
+		log "Successfully assigned floating IP: ${ip}"
+	else
+		log "Error: Failed to assign floating IP: ${ip}"
+	fi
+}
+
 saunafs_assign_ip() {
 	load_config
-	sudo ip -f inet addr add $ipaddr/$netmask dev $iface
-	iface_base=$(echo $iface | cut -f1 -d':') # for alias handling
-	arping -q -U -c5 -w1 $ipaddr -I $iface_base
+	assign_floating_ip "${ipaddr}" "${netmask}" "${iface}"
+	assign_floating_ip "${ipaddr2}" "${netmask2}" "${iface2}"
+}
 
-	if [[ "$ipaddr2" != "" ]]; then
-		sudo ip -f inet addr add $ipaddr2/$netmask2 dev $iface2
-		iface_base2=$(echo $iface2 | cut -f1 -d':') # for alias handling
-		arping -q -U -c5 -w1 $ipaddr2 -I $iface_base2
+drop_floating_ip() {
+	local ip="${1}"
+	local netmask="${2}"
+	local iface="${3}"
+
+	if [[ -z "${ip}" ]]; then
+		return 0
+	fi
+
+	if is_ip_present "${ip}" "${iface}"; then
+		log "Dropping floating IP: ${ip} from interface: ${iface}"
+		if ! sudo ip -f inet addr delete "${ip}/${netmask}" dev "${iface}"; then
+			log "Warning: Failed to drop floating IP: ${ip}"
+		else
+			log "Successfully dropped floating IP: ${ip}"
+		fi
+	else
+		log "Floating IP ${ip} not present - nothing to drop"
 	fi
 }
 
 saunafs_drop_ip() {
 	load_config
-	sudo ip -f inet addr delete $ipaddr/$netmask dev $iface
-	if [[ "$ipaddr2" != "" ]]; then
-		sudo ip -f inet addr delete $ipaddr2/$netmask2 dev $iface2
-	fi
+	drop_floating_ip "${ipaddr}" "${netmask}" "${iface}"
+	drop_floating_ip "${ipaddr2}" "${netmask2}" "${iface2}"
 }
 
 saunafs_dead() {
@@ -307,6 +368,7 @@ print_help() {
 	echo "quick-stop"
 	echo "promote"
 	echo "demote"
+	echo "cleanup"
 	echo "assign-ip"
 	echo "drop-ip"
 	echo "dead"
@@ -322,6 +384,7 @@ case "$1" in
 	quick-stop)        saunafs_quick_stop;;
 	promote)           saunafs_promote;;
 	demote)            saunafs_demote;;
+	cleanup)           saunafs_cleanup_dirty_state;;
 	assign-ip)         saunafs_assign_ip;;
 	drop-ip)           saunafs_drop_ip;;
 	dead)              saunafs_dead;;

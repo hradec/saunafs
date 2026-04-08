@@ -44,6 +44,10 @@
 #include "protocol/matocl.h"
 #include "tools/tools_common_functions.h"
 
+// This import should be placed after other includes to avoid Windows dependency issues
+// with winsock2.h and windows.h
+#include "common/args_stat_encoding.h"
+
 struct master_info_t {
 	uint32_t ip;
 	uint16_t port;
@@ -57,44 +61,42 @@ static int kMaxMasterRetries = 5;
 #endif
 
 static int master_register(int rfd, uint32_t cuid) {
-	uint32_t i;
-	const uint8_t *rptr;
-	uint8_t *wptr, regbuff[8 + 73];
+	MessageBuffer request, response;
 
-	wptr = regbuff;
-	put32bit(&wptr, CLTOMA_FUSE_REGISTER);
-	put32bit(&wptr, 73);
-	memcpy(wptr, FUSE_REGISTER_BLOB_ACL, 64);
-	wptr += 64;
-	put8bit(&wptr, REGISTER_TOOLS);
-	put32bit(&wptr, cuid);
-	put16bit(&wptr, SAUNAFS_PACKAGE_VERSION_MAJOR);
-	put8bit(&wptr, SAUNAFS_PACKAGE_VERSION_MINOR);
-	put8bit(&wptr, SAUNAFS_PACKAGE_VERSION_MICRO);
-	if (tcpwrite(rfd, regbuff, 8 + 73) != 8 + 73) {
-		printf("register to master: send error\n");
+	try {
+		uint8_t regTools = static_cast<uint8_t>(REGISTER_TOOLS);
+		uint16_t majorVer = static_cast<uint16_t>(SAUNAFS_PACKAGE_VERSION_MAJOR);
+		uint8_t minorVer = static_cast<uint8_t>(SAUNAFS_PACKAGE_VERSION_MINOR);
+		uint8_t microVer = static_cast<uint8_t>(SAUNAFS_PACKAGE_VERSION_MICRO);
+		constexpr char kBlobStr[] = FUSE_REGISTER_BLOB_ACL;
+		uint8_t blob[REGISTER_BLOB_SIZE] = {0};
+		std::memcpy(blob, kBlobStr,
+		            (sizeof(kBlobStr) < sizeof(blob)) ? sizeof(kBlobStr) : sizeof(blob));
+
+		serializeLegacyPacket(request, CLTOMA_FUSE_REGISTER, blob, regTools, cuid, majorVer,
+		                      minorVer, microVer);
+
+		response = ServerConnection::sendAndReceive(
+		    rfd, request, MATOCL_FUSE_REGISTER,
+		    ServerConnection::ReceiveMode::kReceiveFirstNonNopMessage, kDefaultTimeoutMs);
+
+		if (response.size() != sizeof(uint8_t)) {
+			printf("register to master: wrong answer (length)\n");
+			return -1;
+		}
+
+		uint8_t status = response[0];
+
+		if (status != SAUNAFS_STATUS_OK) {
+			printf("register to master: %s\n", saunafs_error_string(status));
+			return -1;
+		}
+
+		return 0;
+	} catch (const Exception &e) {
+		fprintf(stderr, "register to master: %s\n", e.what());
 		return -1;
 	}
-	if (tcpread(rfd, regbuff, 9) != 9) {
-		printf("register to master: receive error\n");
-		return -1;
-	}
-	rptr = regbuff;
-	get32bit(&rptr, i);
-	if (i != MATOCL_FUSE_REGISTER) {
-		printf("register to master: wrong answer (type)\n");
-		return -1;
-	}
-	get32bit(&rptr, i);
-	if (i != 1) {
-		printf("register to master: wrong answer (length)\n");
-		return -1;
-	}
-	if (*rptr) {
-		printf("register to master: %s\n", saunafs_error_string(*rptr));
-		return -1;
-	}
-	return 0;
 }
 
 static int master_connect(const master_info_t *info) {
@@ -126,12 +128,10 @@ static bool contains_master_info_name_end(const char *name) {
 static int read_master_info(const char *name, master_info_t *info) {
 	static constexpr int kMasterInfoSize = 14;
 	uint8_t buffer[kMasterInfoSize];
-	struct stat stb;
+	saunafs_stat_t stb;
 	int sd;
 
-	if (stat(name, &stb) < 0) {
-		return -1;
-	}
+	if (stat_portable(name, &stb) < 0) { return -1; }
 
 	if ((stb.st_ino != SPECIAL_INODE_MASTERINFO &&
 	     !contains_master_info_name_end(name)) ||
@@ -266,7 +266,7 @@ void get_next_path_iteration(std::string &path) {
 
 int open_master_conn(const char *name, inode_t *inode, mode_t *mode, [[maybe_unused]] bool needrwfs) {
 	char rpath[PATH_MAX + 1];
-	struct stat stb;
+	saunafs_stat_t stb;
 	[[maybe_unused]] struct statvfs stvfsb;
 	master_info_t master_info;
 
@@ -297,7 +297,7 @@ int open_master_conn(const char *name, inode_t *inode, mode_t *mode, [[maybe_unu
 #else
 	wsl_to_windows_path(rpath, sizeof(rpath));
 #endif
-	if (stat(rpath, &stb) != 0) {
+	if (stat_portable(rpath, &stb) != 0) {
 		printf("%s: (%s) stat error: %s\n", name, rpath, strerr(errno));
 		return -1;
 	}
@@ -322,8 +322,8 @@ int open_master_conn(const char *name, inode_t *inode, mode_t *mode, [[maybe_unu
 	for (;;) {
 		inode_t rpath_inode;
 
-		if (stat(rpath, &stb) != 0) {
-			printf("%s: (%s) stat error: %s\n", name, rpath, strerr(errno));
+		if (stat_portable(rpath, &stb) != 0) {
+			printf("%s: (%s) stat error: %s\n", name, rpath, strerror(errno));
 			return -1;
 		}
 		rpath_inode = stb.st_ino;
@@ -415,8 +415,8 @@ int open_master_conn(const char *name, inode_t *inode, mode_t *mode, [[maybe_unu
 		}
 #endif
 		dirname_inplace(rpath);
-		if (stat(rpath, &stb) != 0) {
-			printf("%s: (%s) stat error: %s\n", name, rpath, strerr(errno));
+		if (stat_portable(rpath, &stb) != 0) {
+			printf("%s: (%s) stat error: %s\n", name, rpath, strerror(errno));
 			return -1;
 		}
 

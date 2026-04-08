@@ -56,6 +56,15 @@ inline std::atomic<uint32_t> gStatsOperationsDuplicate(0);
 inline std::atomic<uint32_t> gStatsOperationsTruncate(0);
 inline std::atomic<uint32_t> gStatsOperationsDupTrunc(0);
 
+inline std::atomic<uint32_t> gStatsOperationsGCPurge(0);
+
+inline std::atomic<uint64_t> gStatsLastReadUsedSpace(0);
+inline std::atomic<uint64_t> gStatsPreviousReadUsedSpace(0);
+
+// This is for internal use of GarbageCollector
+inline std::atomic<uint64_t> gBytesWrittenSinceLastGCSweep(0);
+inline std::atomic<uint64_t> gBytesReadSinceLastGCSweep(0);
+
 struct statsReport {
 	statsReport(uint64_t *overBytesRead, uint64_t *overBytesWrite,
 	            uint32_t *overOpsRead, uint32_t *overOpsWrite,
@@ -96,10 +105,13 @@ void stats(statsReport report);
 
 /// Only called from chartsdata_refresh every minute
 /// The information is saved later (every hour) in the csstats file
-void operationStats(uint32_t *opsCreate, uint32_t *opsDelete,
-                    uint32_t *opsUpdateVersion, uint32_t *opsDuplicate,
-                    uint32_t *opsTruncate, uint32_t *opsDupTrunc,
-                    uint32_t *opsTest);
+void operationStats(uint32_t *opsCreate, uint32_t *opsDelete, uint32_t *opsUpdateVersion,
+                    uint32_t *opsDuplicate, uint32_t *opsTruncate, uint32_t *opsDupTrunc,
+                    uint32_t *opsTest, uint32_t *opsGCPurge);
+
+/// Only called from chartsdata_refresh every minute
+/// The information is saved later (every hour) in the csstats file					
+void getSpaceDeltaStats(int64_t *spaceDelta) ;
 
 void overheadRead(uint32_t size);
 void overheadWrite(uint32_t size);

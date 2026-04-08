@@ -46,19 +46,8 @@ static uint64_t fsnodes_checksum(FSNode *node, bool full_update = false) {
 				static_cast<FSNodeDirectory *>(node)->entries_hash ^=
 				    entry.first->hash();
 			}
-
-			// Case insensitive
-			if (static_cast<FSNodeDirectory *>(node)->case_insensitive) {
-				static_cast<FSNodeDirectory *>(node)->lowerCaseEntriesHash = 0;
-				for (const auto &entry :
-				     static_cast<FSNodeDirectory *>(node)->lowerCaseEntries) {
-					static_cast<FSNodeDirectory *>(node)
-					    ->lowerCaseEntriesHash ^= entry.first->hash();
-				}
-			}
 		}
 		hashCombine(seed, static_cast<const FSNodeDirectory*>(node)->entries_hash);
-		hashCombine(seed, static_cast<const FSNodeDirectory*>(node)->lowerCaseEntriesHash);
 		break;
 	case FSNodeType::kSocket:
 	case FSNodeType::kFifo:
@@ -132,6 +121,7 @@ static void fsnodes_recalculate_checksum() {
 	}
 }
 
+namespace checksum {
 uint64_t fs_checksum(ChecksumMode mode) {
 	uint64_t checksum = 0x1251;
 	hashCombine(checksum, gMetadata->maxInodeId().getValue());
@@ -159,3 +149,4 @@ uint8_t fs_start_checksum_recalculation() {
 	}
 }
 #endif
+}  // namespace checksum

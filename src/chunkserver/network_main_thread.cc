@@ -35,6 +35,7 @@
 #include "chunkserver/chunk_replicator.h"
 #include "chunkserver/g_limiters.h"
 #include "chunkserver/hdd_readahead.h"
+#include "chunkserver/masterconn.h"
 #include "chunkserver/network_main_thread.h"
 #include "chunkserver/network_worker_thread.h"
 #include "common/cwrap.h"
@@ -64,6 +65,12 @@ static uint32_t gNrOfNetworkWorkers;
 static uint32_t gNrOfHddWorkersPerNetworkWorker;
 static uint32_t gBgjobsCountPerNetworkWorker;
 
+static std::atomic<bool> gDoTerminate = false;
+
+bool doTerminate() {
+	return gDoTerminate.load();
+}
+
 void chunkReplicatorReload() {
 	unsigned rep_total = cfg_get_minmaxvalue<unsigned>("REPLICATION_TOTAL_TIMEOUT_MS",
 	                                                   ChunkReplicator::kDefaultTotalTimeout_ms,
@@ -88,6 +95,34 @@ void replicationBandwidthLimitReload() {
 	}
 }
 
+void loadReloadableSettings() {
+	int64_t prevWriteBufferingSize_mb = gWriteBufferingSize_mb;
+	gWriteBufferingSize_mb = cfg_get_minvalue<uint32_t>(
+	    "WRITE_BUFFERING_SIZE_MB", NetworkWorkerThread::kDefaultWriteBufferingSize_mb, 0);
+	int32_t blocksDiff =
+	    ((static_cast<int64_t>(gWriteBufferingSize_mb) - prevWriteBufferingSize_mb) * 1024 * 1024) /
+	    SFSBLOCKSIZE;
+	modifyAvailableWriteBufferingBlocks(blocksDiff);
+
+	gMaxBlocksPerHddWriteJob = cfg_get_minmaxvalue<uint16_t>(
+	    "MAX_BLOCKS_PER_HDD_WRITE_JOB", NetworkWorkerThread::kDefaultMaxBlocksPerHddWriteJob,
+	    NetworkWorkerThread::kMinBlocksPerHddWriteJob,
+	    NetworkWorkerThread::kMaxBlocksPerHddWriteJob);
+	gMaxBlocksPerHddReadJob = cfg_get_minvalue<uint16_t>(
+	    "MAX_BLOCKS_PER_HDD_READ_JOB", NetworkWorkerThread::kDefaultMaxBlocksPerHddReadJob, 1);
+	gMaxParallelHddReadJobsPerCsEntry = cfg_get_minvalue<uint16_t>(
+	    "MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY",
+	    NetworkWorkerThread::kDefaultMaxParallelHddReadJobsPerCsEntry, 1);
+
+	size_t maxBuffersPoolSize_mb = cfg_get_minvalue<size_t>("MAX_BUFFERS_POOL_SIZE_MB", 512, 0);
+	setNewMaxIoBuffersPoolSize(maxBuffersPoolSize_mb);
+
+	gHDDReadAhead.setReadAhead_kB(
+	    cfg_get_maxvalue<uint32_t>("READ_AHEAD_KB", 0, SFSCHUNKSIZE / 1024));
+	gHDDReadAhead.setMaxReadBehind_kB(
+	    cfg_get_maxvalue<uint32_t>("MAX_READ_BEHIND_KB", 0, SFSCHUNKSIZE / 1024));
+}
+
 void mainNetworkThreadReload(void) {
 	TRACETHIS();
 
@@ -106,20 +141,7 @@ void mainNetworkThreadReload(void) {
 	}
 	chunkReplicatorReload();
 
-	gMaxBlocksPerHddWriteJob = cfg_get_minmaxvalue<uint16_t>(
-	    "MAX_BLOCKS_PER_HDD_WRITE_JOB", NetworkWorkerThread::kDefaultMaxBlocksPerHddWriteJob,
-	    NetworkWorkerThread::kMinBlocksPerHddWriteJob,
-	    NetworkWorkerThread::kMaxBlocksPerHddWriteJob);
-	gMaxBlocksPerHddReadJob = cfg_get_minvalue<uint16_t>(
-	    "MAX_BLOCKS_PER_HDD_READ_JOB", NetworkWorkerThread::kDefaultMaxBlocksPerHddReadJob, 1);
-	gMaxParallelHddReadJobsPerCsEntry = cfg_get_minvalue<uint16_t>(
-	    "MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY",
-	    NetworkWorkerThread::kDefaultMaxParallelHddReadJobsPerCsEntry, 1);
-
-	gHDDReadAhead.setReadAhead_kB(
-			cfg_get_maxvalue<uint32_t>("READ_AHEAD_KB", 0, SFSCHUNKSIZE / 1024));
-	gHDDReadAhead.setMaxReadBehind_kB(
-			cfg_get_maxvalue<uint32_t>("MAX_READ_BEHIND_KB", 0, SFSCHUNKSIZE / 1024));
+	loadReloadableSettings();
 
 	char *oldListenHost, *oldListenPort;
 	int newlsock;
@@ -174,21 +196,54 @@ void mainNetworkThreadReload(void) {
 
 void mainNetworkThreadDesc(std::vector<pollfd> &pdesc) {
 	TRACETHIS();
+	if (doTerminate()) {
+		return;
+	}
+
 	pdesc.push_back({lsock, POLLIN, 0});
 	lsockpdescpos = pdesc.size() - 1;
 }
 
-void mainNetworkThreadTerm(void) {
+void mainNetworkThreadWantExit(void) {
 	TRACETHIS();
 	safs::log_info("closing {}:{}", ListenHost, ListenPort);
+	// Closing the listening socket will cause the main thread to stop accepting new connections and
+	// eventually exit after processing existing ones.
 	tcpclose(lsock);
 
 	free(ListenHost);
 	free(ListenPort);
 
+	// Ask worker threads to terminate and close their connections. They will be forcefully
+	// terminated after a timeout if they don't exit on their own.
 	for (auto& threadObject : networkThreadObjects) {
 		threadObject.askForTermination();
 	}
+
+	gDoTerminate.store(true);
+}
+
+bool networkThreadsCanExit() {
+	TRACETHIS();
+	bool allTerminated = true;
+	for (auto &threadObject : networkThreadObjects) {
+		if (!threadObject.updateAndCheckTerminationStatus()) { allTerminated = false; }
+	}
+	return allTerminated;
+}
+
+int mainNetworkThreadCanExit() {
+	// Preserve this order:
+	// networkThreadsCanExit() must be checked before masterconn_canexit().
+	// If masterconn_canexit() is checked first, a network worker may still be processing an
+	// endChunkLock, which could add statuses to the masterconn job pool after masterconn_canexit()
+	// returns true. This could lead to the chunkserver exiting prematurely while holding chunk
+	// locks that have not been replied to the master.
+	return networkThreadsCanExit() && masterconn_canexit();
+}
+
+void mainNetworkThreadTerm(void) {
+	TRACETHIS();
 
 	for (auto &thread : networkThreads) {
 		if (thread.joinable()) { thread.join(); }
@@ -200,6 +255,10 @@ void mainNetworkThreadTerm(void) {
 
 void mainNetworkThreadServe(const std::vector<pollfd> &pdesc) {
 	TRACETHIS();
+	if (doTerminate()) {
+		return;
+	}
+
 	int newSocketFD;
 
 	if (lsockpdescpos >= 0 && (pdesc[lsockpdescpos].revents & POLLIN)) {
@@ -236,21 +295,19 @@ int mainNetworkThreadInit(void) {
 	gBgjobsCountPerNetworkWorker = cfg_get_minvalue<uint32_t>(
 	    "BGJOBSCNT_PER_NETWORK_WORKER",
 	    NetworkWorkerThread::kDefaultMaxBackgroundJobsPerNetworkWorker, 10);
+	std::string ioPriorityModeStr = cfg_getstring("IO_PRIORITY_MODE", "FIFO");
+	if (ioPriorityModeStr == "SWITCH") {
+		// Must clearly say that the mode is Switch, otherwise it will be Fifo. This is because Fifo
+		// is the default and more tested mode.
+		gIOPriorityMode = IOPriorityMode::Switch;
+	} else {
+		gIOPriorityMode = IOPriorityMode::Fifo;
+		if (ioPriorityModeStr != "FIFO") {
+			safs::log_warn("Invalid IO_PRIORITY_MODE '{}', defaulting to FIFO", ioPriorityModeStr);
+		}
+	}
 
-	gMaxBlocksPerHddWriteJob = cfg_get_minmaxvalue<uint16_t>(
-	    "MAX_BLOCKS_PER_HDD_WRITE_JOB", NetworkWorkerThread::kDefaultMaxBlocksPerHddWriteJob,
-	    NetworkWorkerThread::kMinBlocksPerHddWriteJob,
-	    NetworkWorkerThread::kMaxBlocksPerHddWriteJob);
-	gMaxBlocksPerHddReadJob = cfg_get_minvalue<uint16_t>(
-	    "MAX_BLOCKS_PER_HDD_READ_JOB", NetworkWorkerThread::kDefaultMaxBlocksPerHddReadJob, 1);
-	gMaxParallelHddReadJobsPerCsEntry = cfg_get_minvalue<uint16_t>(
-	    "MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY",
-	    NetworkWorkerThread::kDefaultMaxParallelHddReadJobsPerCsEntry, 1);
-
-	gHDDReadAhead.setReadAhead_kB(
-			cfg_get_maxvalue<uint32_t>("READ_AHEAD_KB", 0, SFSCHUNKSIZE / 1024));
-	gHDDReadAhead.setMaxReadBehind_kB(
-			cfg_get_maxvalue<uint32_t>("MAX_READ_BEHIND_KB", 0, SFSCHUNKSIZE / 1024));
+	loadReloadableSettings();
 
 	lsock = tcpsocket();
 	if (lsock < 0) {
@@ -271,6 +328,8 @@ int mainNetworkThreadInit(void) {
 	safs_pretty_syslog(LOG_NOTICE, "main server module: listen on %s:%s", ListenHost, ListenPort);
 
 	eventloop_reloadregister(mainNetworkThreadReload);
+	eventloop_wantexitregister(mainNetworkThreadWantExit);
+	eventloop_canexitregister(mainNetworkThreadCanExit);
 	eventloop_destructregister(mainNetworkThreadTerm);
 	eventloop_pollregister(mainNetworkThreadDesc, mainNetworkThreadServe);
 

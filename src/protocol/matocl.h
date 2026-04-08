@@ -28,22 +28,24 @@
 #include "common/chunk_with_address_and_label.h"
 #include "common/chunks_availability_state.h"
 #include "common/defective_file_info.h"
-#include "common/sessions_file.h"
+#include "common/inotifier_list_entry.h"
 #include "common/io_limits_database.h"
 #include "common/job_info.h"
 #include "common/legacy_acl.h"
-#include "common/metadataserver_list_entry.h"
 #include "common/legacy_string.h"
 #include "common/legacy_vector.h"
+#include "common/metadataserver_list_entry.h"
 #include "common/richacl.h"
 #include "common/serialization_macros.h"
 #include "common/serialized_goal.h"
+#include "common/sessions_file.h"
+#include "protocol/SFSCommunication.h"
 #include "protocol/chunkserver_list_entry.h"
 #include "protocol/directory_entry.h"
+#include "protocol/handle_inode_entry.h"
 #include "protocol/lock_info.h"
-#include "protocol/named_inode_entry.h"
 #include "protocol/mount_info_entry.h"
-#include "protocol/SFSCommunication.h"
+#include "protocol/named_inode_entry.h"
 #include "protocol/packet.h"
 #include "protocol/quota.h"
 
@@ -244,6 +246,11 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		uint32_t, masterVersion,
 		std::vector<MetadataserverListEntry>, shadowList)
 
+// SAU_MATOCL_INOTIFIER_LIST
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, inotifierList, SAU_MATOCL_INOTIFIER_LIST, 0,
+		std::vector<INotifierListEntry>, inotifierList)
+
 // SAU_MATOCL_CHUNKS_INFO
 namespace matocl {
 namespace chunksInfo {
@@ -309,6 +316,13 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, adminRecalculateMetadataChecksum, SAU_MATOCL_ADMIN_RECALCULATE_METADATA_CHECKSUM, 0,
 		uint8_t, status)
+
+// SAU_MATOCL_UNLOCK_CHUNK_NOTICE
+SAUNAFS_DEFINE_PACKET_VERSION(matocl, unlockChunkNotice, kInodeAndChunkIndex, 0)
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, unlockChunkNotice, SAU_MATOCL_UNLOCK_CHUNK_NOTICE, kInodeAndChunkIndex,
+		inode_t, inode,
+		uint32_t, chunkIndex)
 
 // SAU_MATOCL_FUSE_TRUNCATE
 SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseTruncate, kStatusPacketVersion, 0)
@@ -436,6 +450,7 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 
 // SAU_MATOCL_FUSE_GETDIR
 SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseGetDir, kStatus, 0)
+// Not used: just kept to document the historical version numbering
 SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseGetDirLegacy, kLegacyResponse, 1)
 SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseGetDir, kResponseWithDirentIndex, 2)
 
@@ -451,26 +466,32 @@ SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		uint8_t, status)
 
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
-		matocl, fuseGetDirLegacy, SAU_MATOCL_FUSE_GETDIR, kLegacyResponse,
-		uint32_t, message_id,
-		uint64_t, first_entry_index,
-		std::vector<legacy::DirectoryEntry>, dir_entry)
-
-SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, fuseGetDir, SAU_MATOCL_FUSE_GETDIR, kResponseWithDirentIndex,
 		uint32_t, message_id,
 		uint64_t, first_entry_index, //TODO remove (not needed)
 		std::vector<DirectoryEntry>, dir_entry)
 
+SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseGetReserved, kResponseNamedInodeEntry, 0)
+SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseGetReserved, kResponseHandleInodeEntry, 1)
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
-		matocl, fuseGetReserved, SAU_MATOCL_FUSE_GETRESERVED, 0,
+		matocl, fuseGetReserved, SAU_MATOCL_FUSE_GETRESERVED, kResponseNamedInodeEntry,
 		uint32_t, msgid,
 		std::vector<NamedInodeEntry>, entries)
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetReserved, SAU_MATOCL_FUSE_GETRESERVED, kResponseHandleInodeEntry,
+		uint32_t, msgid,
+		std::vector<HandleInodeEntry>, entries)
 
+SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseGetTrash, kResponseNamedInodeEntry, 0)
+SAUNAFS_DEFINE_PACKET_VERSION(matocl, fuseGetTrash, kResponseHandleInodeEntry, 1)
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
-		matocl, fuseGetTrash, SAU_MATOCL_FUSE_GETTRASH, 0,
+		matocl, fuseGetTrash, SAU_MATOCL_FUSE_GETTRASH, kResponseNamedInodeEntry,
 		uint32_t, msgid,
 		std::vector<NamedInodeEntry>, entries)
+SAUNAFS_DEFINE_PACKET_SERIALIZATION(
+		matocl, fuseGetTrash, SAU_MATOCL_FUSE_GETTRASH, kResponseHandleInodeEntry,
+		uint32_t, msgid,
+		std::vector<HandleInodeEntry>, entries)
 
 SAUNAFS_DEFINE_PACKET_SERIALIZATION(
 		matocl, listTasks, SAU_MATOCL_LIST_TASKS, 0,

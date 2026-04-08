@@ -2,19 +2,20 @@ GIT_COMMIT_EMAIL = ""
 GIT_COMMIT_HASH = ""
 REGISTRY_URL = "registry.ci.leil.io"
 
-def buildSfstests() {
+def buildLfstests() {
+    // TODO(rolysr): We should build from latest lfstests release
     sh '''
-        git clone "https://github.com/leil-io/sfstests"
-        cd sfstests
-        git checkout v0.5.0
-        go build -o $WORKSPACE/sfstests
+        git clone "https://github.com/leil-io/lfstests"
+        cd lfstests
+        git checkout dev
+        go build -o $WORKSPACE/lfstests
         '''
 }
 
 def buildImage(imageName) {
     sh """
         cd $WORKSPACE
-        mkdir build
+        mkdir -p build
         docker buildx build --build-arg BASE_IMAGE=${imageName} --tag saunafs-test:latest -f tests/docker/Dockerfile.test $WORKSPACE
         """
 }
@@ -29,7 +30,7 @@ def pushImage(registryImageName) {
 def runSanity() {
     def resultsFile = "test_results_sanity.xml"
     sh """
-        ./sfstests/sfstests \
+        ./lfstests/lfstests \
         --auth /etc/apt/auth.conf.d/ \
         --workers ${SANITY_WORKERS} \
         --multiplier ${MACHINE_MULTIPLIER} \
@@ -38,23 +39,10 @@ def runSanity() {
         """
     publishJunit(resultsFile)
 }
-def runFoundationDB() {
-    def resultsFile = "test_results_fdb.xml"
-    sh """
-        ./sfstests/sfstests \
-        --auth /etc/apt/auth.conf.d/ \
-        --suite FDBTests \
-        --workers 1 \
-        --multiplier ${MACHINE_MULTIPLIER} \
-        --cpus 2 \
-        --xml-path ${resultsFile}
-        """
-    publishJunit(resultsFile)
-}
 def runShort() {
     def resultsFile = "test_results_short.xml"
     sh """
-        ./sfstests/sfstests \
+        ./lfstests/lfstests \
         --auth /etc/apt/auth.conf.d/ \
         --suite ShortSystemTests \
         --workers ${SHORT_WORKERS} \
@@ -66,7 +54,7 @@ def runShort() {
 }
 def runMachine() {
     def resultsFile = "test_results_machine.xml"
-    sh """ ./sfstests/sfstests \
+    sh """ ./lfstests/lfstests \
         --auth /etc/apt/auth.conf.d/ \
         --suite SingleMachineTests \
         --workers 1 \
@@ -78,7 +66,7 @@ def runMachine() {
 }
 def runLong() {
     def resultsFile = "test_results_long.xml"
-    sh """ ./sfstests/sfstests \
+    sh """ ./lfstests/lfstests \
         --auth /etc/apt/auth.conf.d/ \
         --workers ${LONG_WORKERS} \
         --suite LongSystemTests \
@@ -193,6 +181,74 @@ pipeline {
         }
         stage('Build and test') {
             parallel {
+                stage('Run special tests (Ubuntu 24.04)') {
+                    agent {label 'unittests'}
+                    stages {
+                        stage("Checkout source") {
+                            steps {
+                                checkout scm
+                            }
+                        }
+                        stage("Build and unit test") {
+                            steps {
+                                sh """
+                                    export PATH="/usr/lib/ccache:$PATH"
+                                    cd vcpkg
+                                    ./bootstrap-vcpkg.sh
+                                    cd ..
+                                    mkdir -p build
+                                    cd build
+                                    nice cmake \
+                                         -DCMAKE_TOOLCHAIN_FILE="../vcpkg/scripts/buildsystems/vcpkg.cmake" \
+                                         -DENABLE_CLIENT_LIB=ON \
+                                         -DENABLE_DOCS=ON \
+                                         -DENABLE_NFS_GANESHA=ON \
+                                         -DENABLE_POLONAISE=OFF \
+                                         -DENABLE_URAFT=ON \
+                                         -DGSH_CAN_HOST_LOCAL_FS=ON \
+                                         -DCMAKE_INSTALL_PREFIX="/usr/local/" \
+                                         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                                         -DENABLE_TESTS=ON \
+                                         -DCODE_COVERAGE=OFF \
+                                         -DSAUNAFS_TEST_POINTER_OBFUSCATION=ON \
+                                         -DENABLE_WERROR=ON \
+                                         -DENABLE_FOUNDATIONDB=ON \
+                                    ..
+                                    cd src/unittests
+                                    nice make -j\$((\$(nproc) / 2))
+                                    # Make sure that failures do NOT fail the pipeline
+                                    sudo systemctl restart foundationdb
+                                    ./unittests || true
+                                """
+                                publishJunit("build/src/unittests/*test_detail.xml")
+                            }
+                        }
+                        stage("Build and run rebalancing tests") {
+                            steps {
+                                sh """
+                                    export PATH="/usr/lib/ccache:$PATH"
+                                    cd build
+                                    sudo nice make -j\$((\$(nproc) / 2)) install
+                                    saunafs-tests --gtest_filter="RebalancingTests*" --gtest_output="xml:./rebalance_test_detail.xml" || true
+                                """
+                                publishJunit("build/*test_detail.xml")
+                            }
+                        }
+                    }
+                    post {
+                        failure {
+                            slackBadMessage(
+                                "Unit tests failed on ${BRANCH_NAME}",
+                                "Unit tests failed on branch ${BRANCH_NAME}, build number ${BUILD_NUMBER}"
+                            )
+                        }
+                        cleanup {
+                            sh """
+                                sudo chown \$(id -u):\$(id -g) $WORKSPACE -R
+                            """
+                        }
+                    }
+                }
                 stage('Build with clang') {
                     agent {label 'build'}
                     steps {
@@ -283,9 +339,9 @@ pipeline {
                                 checkout scm
                             }
                         }
-                        stage('Build sfstests') {
+                        stage('Build lfstests') {
                             steps {
-                                buildSfstests()
+                                buildLfstests()
                             }
                         }
 
@@ -302,12 +358,6 @@ pipeline {
                         stage('Run Sanity') {
                             steps {
                                 runSanity()
-                            }
-                        }
-
-                        stage('Run FoundationDB tests') {
-                            steps {
-                                runFoundationDB()
                             }
                         }
 

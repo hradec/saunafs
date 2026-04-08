@@ -44,6 +44,9 @@ SaunaFsAdminCommand::SupportedOptions DumpConfigurationCommand::supportedOptions
 			defaultsMode,
 			    "Return default values as well. This is informational and may "
 			    "not be correct in all cases."
+		},
+		{
+			kTlsMode, kTlsModeDescription
 		}
 	};
 }
@@ -54,8 +57,10 @@ void DumpConfigurationCommand::run(const Options &options) const {
 		    "Expected <master ip> and <master port> for " + name());
 	}
 
-	auto connection = RegisteredAdminConnection::create(options.argument(0),
-	                                                    options.argument(1));
+	auto tlsCfg =
+	    options.getValue<std::string>("--tlsconfigfile", std::string(TlsSession::kNoFile));
+
+	auto connection = RegisteredAdminConnection::create(options.argument(0), options.argument(1), tlsCfg);
 	auto adminResponse = connection->sendAndReceive(
 	    cltoma::adminDumpConfiguration::build(), SAU_MATOCL_ADMIN_DUMP_CONFIG);
 
@@ -111,7 +116,6 @@ const static std::unordered_map<std::string, std::string> defaultOptionsMaster =
     {"ENDANGERED_CHUNKS_MAX_CAPACITY", "1048576"},
     {"ACCEPTABLE_DIFFERENCE", "0.1"},
     {"CHUNKS_REBALANCING_BETWEEN_LABELS", "0"},
-    {"REJECT_OLD_CLIENTS", "0"},
     {"GLOBALIOLIMITS_FILENAME", ""},
     {"GLOBALIOLIMITS_RENEGOTIATION_PERIOD_SECONDS", "0.1"},
     {"GLOBALIOLIMITS_ACCUMULATE_MS", "250"},
@@ -129,7 +133,11 @@ const static std::unordered_map<std::string, std::string> defaultOptionsMaster =
     {"SNAPSHOT_INITIAL_BATCH_SIZE_LIMIT", "10000"},
     {"FILE_TEST_LOOP_MIN_TIME", "3600"},
     {"PRIORITIZE_DATA_PARTS", "1"},
+    {"USE_CHUNKSERVER_SIDE_CHUNK_LOCK", "0"},
     {"CREATE_EMPTY_FOLDERS_WHEN_SPACE_DEPLETED", "1"},
+    {"TLS_CERT_FILE", ""},
+    {"TLS_KEY_FILE", ""},
+    {"TLS_CA_CERT_FILE", ""},
 };
 
 const static std::unordered_map<std::string, std::string> defaultOptionsShadow = {
@@ -138,6 +146,9 @@ const static std::unordered_map<std::string, std::string> defaultOptionsShadow =
     {"MASTER_RECONNECTION_DELAY", "1"},
 	{"MASTER_TIMEOUT", "60"},
     {"LOAD_FACTOR_PENALTY", "0.0"},
+    {"TLS_CERT_FILE", ""},
+    {"TLS_KEY_FILE", ""},
+    {"TLS_CA_CERT_FILE", ""},
 };
 
 const static std::unordered_map<std::string, std::string> defaultOptionsCS = {
@@ -166,20 +177,28 @@ const static std::unordered_map<std::string, std::string> defaultOptionsCS = {
     {"NR_OF_NETWORK_WORKERS", "4"},
     {"NR_OF_HDD_WORKERS_PER_NETWORK_WORKER", "16"},
     {"BGJOBSCNT_PER_NETWORK_WORKER", "4000"},
+    {"IO_PRIORITY_MODE", "FIFO"},
+    {"WRITE_BUFFERING_SIZE_MB", "0"},
     {"MAX_BLOCKS_PER_HDD_WRITE_JOB", "16"},
-    {"MAX_BLOCKS_PER_HDD_READ_JOB", "8"},
-    {"MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY", "16"},
+    {"MAX_BLOCKS_PER_HDD_READ_JOB", "16"},
+    {"MAX_PARALLEL_HDD_READ_JOBS_PER_CS_ENTRY", "1"},
+    {"MAX_BUFFERS_POOL_SIZE_MB", "512"},
     {"MAX_READ_BEHIND_KB", "0"},
     {"PERFORM_FSYNC", "1"},
     {"STAT_CHUNKS_AT_DISK_SCAN", "1"},
     {"REPLICATION_TOTAL_TIMEOUT_MS", "60000"},
     {"REPLICATION_CONNECTION_TIMEOUT_MS", "1000"},
     {"REPLICATION_WAVE_TIMEOUT_MS", "500"},
+    {"PLUGINS_DIR", ""},
     {"CHUNK_TRASH_ENABLED", "0"},
     {"CHUNK_TRASH_EXPIRATION_SECONDS", "259200"},
     {"CHUNK_TRASH_FREE_SPACE_THRESHOLD_GB", "0"},
-    {"CHUNK_TRASH_GC_BATCH_SIZE", "1000"},
+    {"CHUNK_TRASH_GC_BATCH_SIZE", "500"},
     {"CHUNK_TRASH_GC_SPACE_RECOVERY_BATCH_SIZE", "100"},
+    {"CHUNK_TRASH_GC_PURGE_WORKERS_NR","5"},
+    {"TLS_CERT_FILE", ""},
+    {"TLS_KEY_FILE", ""},
+    {"TLS_CA_CERT_FILE", ""},
 };
 
 const static std::unordered_map<std::string, std::string> defaultOptionsMeta = {
@@ -195,6 +214,9 @@ const static std::unordered_map<std::string, std::string> defaultOptionsMeta = {
     {"MASTER_HOST", "sfsmaster"},
     {"MASTER_PORT", "9419"},
     {"MASTER_RECONNECTION_DELAY", "1"},
+    {"TLS_CERT_FILE", ""},
+    {"TLS_KEY_FILE", ""},
+    {"TLS_CA_CERT_FILE", ""},
 };
 // clang-format on
 

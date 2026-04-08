@@ -23,18 +23,18 @@
 #include "master/settrashtime_task.h"
 
 #include "master/filesystem_checksum.h"
-#include "master/filesystem_node.h"
-#include "master/filesystem_operations.h"
+#include "master/filesystem_metadata.h"
+#include "master/filesystem_operations_interface.h"
 
 int SetTrashtimeTask::execute(uint32_t ts, intrusive_list<Task> &work_queue) {
 	assert(current_inode_ != inode_list_.end());
 
 	inode_t inode = *current_inode_;
 	++current_inode_;
-	FSNode *node = fsnodes_id_to_node(inode);
-	if (!node) {
-		return SAUNAFS_ERROR_EINVAL;
-	}
+	auto fsOpContext = gFSOperations->createFilesystemOperationContext(
+	    FilesystemOperationContext::TransactionType::kReadWrite);
+	FSNode *node = gFSOperations->nodeOperations()->idToNode(fsOpContext, inode);
+	if (!node) { return SAUNAFS_ERROR_EINVAL; }
 
 	uint8_t result = setTrashtime(node, ts);
 
@@ -56,11 +56,25 @@ int SetTrashtimeTask::execute(uint32_t ts, intrusive_list<Task> &work_queue) {
 		}
 		(*stats_)[result] += 1;
 		if (result == kChanged) {
-			fs_changelog(ts,
-			             "SETTRASHTIME(%" PRIiNode ",%" PRIu32 ",%" PRIu32 ",%" PRIu8 ")",
-			             inode, uid_, trashtime_, smode_);
+			gFSOperations->changeLog(
+			    fsOpContext, ts, "SETTRASHTIME(%" PRIiNode ",%" PRIu32 ",%" PRIu32 ",%" PRIu8 ")",
+			    inode, uid_, trashtime_, smode_);
+
+			// Schedule the node update for KV backends.
+			if (fsOpContext.hasReadWriteTransaction()) {
+				gFSOperations->nodeOperations()->updateNode(fsOpContext, node);
+			}
 		}
 	}
+
+	if (result == kChanged && fsOpContext.hasReadWriteTransaction()) {
+		if (!fsOpContext.getReadWriteTransaction()->commit()) {
+			safs::log_err("{}: transaction failed to commit: inode {}, trashtime {}, smode {}",
+			              __func__, inode, trashtime_, static_cast<uint32_t>(smode_));
+			return SAUNAFS_ERROR_IO;
+		}
+	}
+
 	return SAUNAFS_STATUS_OK;
 }
 
@@ -73,7 +87,8 @@ uint8_t SetTrashtimeTask::setTrashtime(FSNode *node, uint32_t ts) {
 
 	if (node->type == FSNodeType::kFile || node->type == FSNodeType::kDirectory ||
 	    node->type == FSNodeType::kTrash || node->type == FSNodeType::kReserved) {
-		if ((node->mode & (EATTR_NOOWNER << 12)) == 0 && uid_ != 0 && node->uid != uid_) {
+		if ((node->mode & (EATTR_NOOWNER << EATTR_BIT_OFFSET)) == 0 && uid_ != 0 &&
+		    node->uid != uid_) {
 			return SetTrashtimeTask::kNotPermitted;
 		} else {
 			set = 0;
@@ -101,11 +116,7 @@ uint8_t SetTrashtimeTask::setTrashtime(FSNode *node, uint32_t ts) {
 			if (set) {
 				node->ctime = ts;
 				if (node->type == FSNodeType::kTrash) {
-					hstorage::Handle path =
-					        std::move(gMetadata->trash.at(old_trash_key));
-					gMetadata->trash.erase(old_trash_key);
-					gMetadata->trash.insert(
-					        {TrashPathKey(node), std::move(path)});
+					updateTrashFromOldEntry(gMetadata->trash, node, old_trash_key);
 				}
 				fsnodes_update_checksum(node);
 				return SetTrashtimeTask::kChanged;

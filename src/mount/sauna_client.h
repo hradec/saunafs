@@ -33,6 +33,7 @@
 #include "common/exception.h"
 #include "common/stat32.h"
 #include "common/stat_defs.h"
+#include "common/tls_session.h"
 #include "common/type_defs.h"
 #include "mount/group_cache.h"
 #include "mount/mount_info.h"
@@ -78,7 +79,6 @@ struct FsInitParams {
 
 	static constexpr float    kDefaultBandwidthOveruse = 1.0;
 	static constexpr unsigned kDefaultChunkserverWriteTo = 5000;
-	static constexpr bool     kDefaultIgnoreFlush = false;
 	static constexpr int      kDefaultLogNotificationArea = 0;
 	static constexpr unsigned kDefaultMessageSuppressionPeriod = 10;
 	static constexpr unsigned kDefaultStatfsCacheTo = 0;
@@ -104,9 +104,9 @@ struct FsInitParams {
 	static constexpr bool     kDefaultMkdirCopySgid = true;
 	static constexpr unsigned kDefaultWriteWaveTo = 50;
 #endif
-	static constexpr bool     kDefaultUseInodeBasedWriteAlgorithm = false;
+	static constexpr unsigned kDefaultMaxChunksWrittenInParallelPerInode = 0;
 	static constexpr unsigned kDefaultWriteCacheSize = 128;
-	static constexpr unsigned kDefaultCachePerInodePercentage = 25;
+	static constexpr unsigned kDefaultCachePerInodePercentage = 100;
 	static constexpr unsigned kDefaultWriteWorkers = 10;
 	static constexpr unsigned kDefaultWriteWindowSize = 15;
 	static constexpr unsigned kDefaultSymlinkCacheTimeout = 3600;
@@ -116,6 +116,8 @@ struct FsInitParams {
 	static constexpr int      kDefaultKeepCache = 0;
 	static constexpr double   kDefaultDirentryCacheTimeout = 0.25;
 	static constexpr unsigned kDefaultDirentryCacheSize = 100000;
+	static constexpr unsigned kDefaultNegativeCacheTo = 0;
+	static constexpr unsigned kDefaultNegativeCacheSize = 0;
 	static constexpr double   kDefaultEntryCacheTimeout = 0.0;
 	static constexpr double   kDefaultAttrCacheTimeout = 1.0;
 #if defined(DEFAULT_SUGID_CLEAR_MODE_EXT)
@@ -132,6 +134,10 @@ struct FsInitParams {
 	static constexpr unsigned kDefaultAclCacheSize = 1000;
 	static constexpr bool     kDefaultVerbose = false;
 	static constexpr bool     kDirectIO = false;
+
+	// TLS related parameters
+	static constexpr std::string_view kDefaultTlsConfigFile = TlsSession::kNoFile;
+
 	// Thank you, GCC 4.6, for no delegating constructors
 	FsInitParams()
 	             : bind_host(), host(), port(), meta(false), mountpoint(), subfolder(kDefaultSubfolder),
@@ -158,6 +164,7 @@ struct FsInitParams {
 	             symlink_cache_timeout_s(kDefaultSymlinkCacheTimeout),
 	             debug_mode(kDefaultDebugMode), keep_cache(kDefaultKeepCache),
 	             direntry_cache_timeout(kDefaultDirentryCacheTimeout), direntry_cache_size(kDefaultDirentryCacheSize),
+				 negative_cache_timeout(kDefaultNegativeCacheTo), negative_cache_size(kDefaultNegativeCacheSize),
 	             entry_cache_timeout(kDefaultEntryCacheTimeout), attr_cache_timeout(kDefaultAttrCacheTimeout),
 	             mkdir_copy_sgid(kDefaultMkdirCopySgid), sugid_clear_mode(kDefaultSugidClearMode),
 	             use_rw_lock(kDefaultUseRwLock),
@@ -171,14 +178,15 @@ struct FsInitParams {
 #else
 	             malloc_trim_period(kDefaultMallocTrimPeriod),
 #endif
-	             use_inode_based_write_algorithm(kDefaultUseInodeBasedWriteAlgorithm),
-	             ignore_flush(kDefaultIgnoreFlush), statfs_cache_timeout(kDefaultStatfsCacheTo),
+	             max_chunks_written_in_parallel_per_inode(kDefaultMaxChunksWrittenInParallelPerInode),
+	             statfs_cache_timeout(kDefaultStatfsCacheTo),
 	             use_quota_in_volume_size(kDefaultUseQuotaInVolumeSize),
 	             max_wait_retry_time(kDefaultMaxWaitRetryTime),
 	             mastercomm_sleep_time_divisor(kDefaultMasterCommSleepTimeDivisor),
 	             verbose(kDefaultVerbose), direct_io(kDirectIO),
 	             log_notifications_area(kDefaultLogNotificationArea),
-	             message_suppression_period(kDefaultMessageSuppressionPeriod) {
+	             message_suppression_period(kDefaultMessageSuppressionPeriod),
+	             tls_config_file(kDefaultTlsConfigFile) {
 	}
 
 	FsInitParams(const std::string &bind_host, const std::string &host, const std::string &port, const std::string &mountpoint)
@@ -206,6 +214,7 @@ struct FsInitParams {
 	             symlink_cache_timeout_s(kDefaultSymlinkCacheTimeout),
 	             debug_mode(kDefaultDebugMode), keep_cache(kDefaultKeepCache),
 	             direntry_cache_timeout(kDefaultDirentryCacheTimeout), direntry_cache_size(kDefaultDirentryCacheSize),
+				 negative_cache_timeout(kDefaultNegativeCacheTo), negative_cache_size(kDefaultNegativeCacheSize),
 	             entry_cache_timeout(kDefaultEntryCacheTimeout), attr_cache_timeout(kDefaultAttrCacheTimeout),
 	             mkdir_copy_sgid(kDefaultMkdirCopySgid), sugid_clear_mode(kDefaultSugidClearMode),
 	             use_rw_lock(kDefaultUseRwLock),
@@ -218,15 +227,16 @@ struct FsInitParams {
 	             ignore_utimens_update(kDefaultIgnoreUtimensUpdate),
 #else
 	             malloc_trim_period(kDefaultMallocTrimPeriod),
-#endif 
-	             use_inode_based_write_algorithm(kDefaultUseInodeBasedWriteAlgorithm),
-	             ignore_flush(kDefaultIgnoreFlush), statfs_cache_timeout(kDefaultStatfsCacheTo),
+#endif
+	             max_chunks_written_in_parallel_per_inode(kDefaultMaxChunksWrittenInParallelPerInode),
+	             statfs_cache_timeout(kDefaultStatfsCacheTo),
 	             use_quota_in_volume_size(kDefaultUseQuotaInVolumeSize),
 	             max_wait_retry_time(kDefaultMaxWaitRetryTime),
 	             mastercomm_sleep_time_divisor(kDefaultMasterCommSleepTimeDivisor),
 	             verbose(kDefaultVerbose), direct_io(kDirectIO),
 	             log_notifications_area(kDefaultLogNotificationArea),
-	             message_suppression_period(kDefaultMessageSuppressionPeriod) {
+	             message_suppression_period(kDefaultMessageSuppressionPeriod),
+	             tls_config_file(kDefaultTlsConfigFile) {
 	}
 
 	std::string bind_host;
@@ -267,6 +277,8 @@ struct FsInitParams {
 	int keep_cache;
 	double direntry_cache_timeout;
 	unsigned direntry_cache_size;
+	unsigned negative_cache_timeout;
+	unsigned negative_cache_size;
 	double entry_cache_timeout;
 	double attr_cache_timeout;
 	bool mkdir_copy_sgid;
@@ -286,8 +298,7 @@ struct FsInitParams {
 	unsigned malloc_trim_period;
 #endif
 
-	bool use_inode_based_write_algorithm;
-	bool ignore_flush;
+	unsigned max_chunks_written_in_parallel_per_inode;
 	unsigned statfs_cache_timeout;
 	bool use_quota_in_volume_size;
 	unsigned max_wait_retry_time;
@@ -296,6 +307,9 @@ struct FsInitParams {
 	bool direct_io;
 	int log_notifications_area;
 	unsigned message_suppression_period;
+
+	// TLS related parameters
+	std::string tls_config_file;
 
 	std::string io_limits_config_file;
 };

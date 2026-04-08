@@ -60,6 +60,7 @@
 #endif // SAUNAFS_HAVE_THREAD_LOCAL
 #include <atomic>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -108,6 +109,12 @@ static std::vector<std::pair<std::unique_ptr<IDisk>, std::vector<ChunkWithType>>
     gDisksToBeDeletedWithPendingChunks;
 static std::vector<std::pair<IDisk *, std::vector<ChunkWithType>>>
     gNewDisksToBeDeletedWithPendingChunks;
+
+static std::mutex gAlreadyRepliedInputBuffersMutex;
+using InputBufferWithWriteInfo = std::pair<std::shared_ptr<InputBuffer>, std::vector<WriteInfo>>;
+static std::unordered_map<ChunkWithType, std::list<InputBufferWithWriteInfo>, KeyOperations,
+                          KeyOperations>
+    gAlreadyRepliedInputBuffers;
 
 /// @enum SendDataToMasterMode
 /// @brief Represents the reason of sending data to the master server.
@@ -403,6 +410,10 @@ void hddCheckDisks() {
 					gDisksToBeDeletedWithPendingChunks.emplace_back(
 					    std::move(*it), std::move(diskToDelWithPendingChunks.second));
 				}
+				ChunkTrashManager::eraseDisk((*it)->metaPath());
+				if (!(*it)->isZonedDevice() && (*it)->metaPath() != (*it)->dataPath()) {
+					ChunkTrashManager::eraseDisk((*it)->dataPath());
+				}
 				gDisks.erase(it);
 				break;
 			}
@@ -575,6 +586,8 @@ void hddGetTotalSpace(uint64_t *usedSpace, uint64_t *totalSpace,
 	*toDelUsedSpace = toDelTotal - toDelAvailable;
 	*toDelTotalSpace = toDelTotal;
 	*toDelChunkCount = toDelChunks;
+
+	HddStats::gStatsLastReadUsedSpace = *usedSpace;
 }
 
 int hddGetLoadFactor() {
@@ -620,6 +633,125 @@ int hddClose(IChunk *chunk) {
 		hddReportDamagedChunk(chunk->id(), chunk->type());
 	}
 	return status;
+}
+
+void hddInsertAlreadyRepliedInputBuffer(uint64_t chunkId, ChunkPartType chunkType,
+                                        std::shared_ptr<InputBuffer> inputBuffer,
+                                        bool isFirstReply) {
+	TRACETHIS2(chunkId, chunkType.toString());
+
+	std::lock_guard lock(gAlreadyRepliedInputBuffersMutex);
+	if (isFirstReply) {
+		auto writeInfoVec = inputBuffer->getWriteInfoVector();
+		gAlreadyRepliedInputBuffers[{chunkId, chunkType}].emplace_back(std::move(inputBuffer),
+		                                                               std::move(writeInfoVec));
+	} else {
+		// For subsequent replies, we need to find the existing input buffer and update its write
+		// info vector
+		auto it = gAlreadyRepliedInputBuffers.find({chunkId, chunkType});
+		if (it == gAlreadyRepliedInputBuffers.end()) {
+			// If the entry for this chunk is not found, we just skip the update.
+			return;
+		}
+		auto &inputBufferList = it->second;
+		// We assume that the input buffer is already in the list, since it should have been added
+		// when the first reply was done. If it's not found, we just skip the update.
+		for (auto &inputBufferWithWriteInfo : inputBufferList) {
+			if (inputBufferWithWriteInfo.first == inputBuffer) {
+				inputBufferWithWriteInfo.second = inputBuffer->getWriteInfoVector();
+				break;
+			}
+		}
+	}
+}
+
+void hddRemoveAlreadyRepliedInputBuffer(uint64_t chunkId, ChunkPartType chunkType,
+                                        std::shared_ptr<InputBuffer> inputBuffer) {
+	TRACETHIS2(chunkId, chunkType.toString());
+
+	std::lock_guard lock(gAlreadyRepliedInputBuffersMutex);
+	if (gAlreadyRepliedInputBuffers.contains({chunkId, chunkType})) {
+		auto &inputBufferList = gAlreadyRepliedInputBuffers[{chunkId, chunkType}];
+		inputBufferList.remove_if([&inputBuffer](const InputBufferWithWriteInfo &item) {
+			return item.first == inputBuffer;
+		});
+		if (inputBufferList.empty()) { gAlreadyRepliedInputBuffers.erase({chunkId, chunkType}); }
+	}
+}
+
+// This function is called when we have a read request and we want to update the output buffer with
+// data from already replied input buffers that overlap with the requested range. This allows us to
+// patch the output buffer with the data that should be already in the disk.
+// @param chunkId the id of the chunk being read
+// @param chunkType the type of the chunk being read
+// @param offset the offset of the read request
+// @param size the size of the read request
+// @param outputBuffer the output buffer to be updated
+void hddUpdateOutputBufferWithAlreadyRepliedInputBuffers(uint64_t chunkId, ChunkPartType chunkType,
+                                                         uint32_t offset, uint32_t size,
+                                                         OutputBuffer *outputBuffer) {
+	TRACETHIS2(chunkId, chunkType.toString());
+
+	uint32_t endOffset = offset + size;
+	// We need to check all already replied input buffers for this chunk and see if there is any
+	// overlap. It is important to keep the lock while we are checking and updating the output
+	// buffer, to make sure that the input buffers are not modified by other threads while we are
+	// using them.
+	// TODO (dave): consider creating multiple locks for different chunks to reduce contention, if
+	// this becomes a bottleneck.
+	std::lock_guard lock(gAlreadyRepliedInputBuffersMutex);
+	auto it = gAlreadyRepliedInputBuffers.find({chunkId, chunkType});
+	if (it == gAlreadyRepliedInputBuffers.end()) { return; }
+	auto &inputBufferList = it->second;
+
+	for (const auto &[inputBuffer, writeInfoVec] : inputBufferList) {
+		uint16_t repliedBlocks = inputBuffer->repliedBlocks;
+
+		// For each block that was replied to the client, check if it overlaps with the
+		// requested range
+		for (uint16_t blockNum = 0; blockNum < repliedBlocks; ++blockNum) {
+			auto &writeInfo = writeInfoVec[blockNum];
+			uint32_t opOffset = writeInfo.offset + writeInfo.blockNum * SFSBLOCKSIZE;
+			uint32_t opEndOffset = opOffset + writeInfo.size;
+
+			uint32_t commonStart = std::max(offset, opOffset);
+			uint32_t commonEnd = std::min(endOffset, opEndOffset);
+
+			if (commonStart >= commonEnd) {
+				// No overlap
+				continue;
+			}
+			// There is an overlap in [commonStart, commonEnd) range, we need to copy data from
+			// input buffer to output buffer
+
+			// Calculate the offsets and sizes for copying
+			// The start offset in the input buffer blocks is already in the block
+			uint32_t startOffsetInInputBufferBlock = commonStart - opOffset;
+			// If the output buffer is from a read in a single block, the this start offset is ok
+			uint32_t startOffsetInOutputBufferBlock = commonStart - offset;
+			uint32_t blockIndexInOutputBuffer = 0;
+			uint32_t blockSizeInOutputBuffer = size;
+			if (offset % SFSBLOCKSIZE == 0) {
+				// Aligned case, could be multiblock read
+				if (startOffsetInOutputBufferBlock / SFSBLOCKSIZE == size / SFSBLOCKSIZE) {
+					// Last block
+					blockSizeInOutputBuffer = (size - 1) % SFSBLOCKSIZE + 1;
+				} else {
+					// Full blocks
+					blockSizeInOutputBuffer = SFSBLOCKSIZE;
+				}
+				blockIndexInOutputBuffer = startOffsetInOutputBufferBlock / SFSBLOCKSIZE;
+				startOffsetInOutputBufferBlock %= SFSBLOCKSIZE;
+			}  // Unaligned case, single block read -> everything is correct
+			uint32_t bytesToCopy = commonEnd - commonStart;
+
+			outputBuffer->updateIntervalBlockData(
+			    blockIndexInOutputBuffer, startOffsetInOutputBufferBlock, bytesToCopy,
+			    inputBuffer->getBlockBufferData(blockNum, startOffsetInInputBufferBlock));
+
+			outputBuffer->updateBlockCRC(blockIndexInOutputBuffer, blockSizeInOutputBuffer);
+		}
+	}
 }
 
 int hddClose(uint64_t chunkId, ChunkPartType chunkType) {
@@ -735,10 +867,11 @@ static void hddReadAheadAndBehind(IChunk *chunk, uint16_t block,
 		chunk->owner()->prefetchChunkBlocks(
 		    *chunk, firstBlockToRead,
 		    blocksToBeReadAhead + block - firstBlockToRead);
-		OutputBuffer buffer = OutputBuffer(kIgnoreHeaderSize, block - firstBlockToRead);
+		auto buffer = getReadOutputBufferPool().get(kIgnoreHeaderSize, block - firstBlockToRead);
 		for (uint16_t b = firstBlockToRead; b < block; ++b) {
-			hddReadCrcAndBlock(chunk, b, &buffer, false);
+			hddReadCrcAndBlock(chunk, b, buffer.get(), false);
 		}
+		getReadOutputBufferPool().put(std::move(buffer));
 	} else {
 		chunk->owner()->prefetchChunkBlocks(*chunk, block, blocksToBeReadAhead);
 	}
@@ -787,6 +920,8 @@ int hddRead(uint64_t chunkId, uint32_t version, ChunkPartType chunkType,
 	LOG_AVG_TILL_END_OF_SCOPE0("hddRead");
 	TRACETHIS3(chunkId, offset, size);
 
+	auto originalOffset = offset;
+	auto originalSize = size;
 	uint16_t block = offset / SFSBLOCKSIZE;
 
 	safs::log_debug("hddRead: chunkId: {}, block: {}, offset: {}, size: {}",
@@ -898,6 +1033,11 @@ int hddRead(uint64_t chunkId, uint32_t version, ChunkPartType chunkType,
 				    tmp.rawData(OutputBuffer::BufferType::Block) + offsetWithinBlock, size);
 			}
 		}
+	}
+
+	if (status == SAUNAFS_STATUS_OK) {
+		hddUpdateOutputBufferWithAlreadyRepliedInputBuffers(chunkId, chunkType, originalOffset,
+		                                                    originalSize, outputBuffer);
 	}
 
 	PRINTTHIS(status);
@@ -2490,7 +2630,10 @@ void hddDiskScanThread(IDisk *disk) {
 	}
 
 	gHddSpaceChanged = true;
-
+	ChunkTrashManager::registerDiskPath(disk->metaPath());
+	if (!disk->isZonedDevice() && disk->metaPath() != disk->dataPath()) {
+		ChunkTrashManager::registerDiskPath(disk->dataPath());
+	}
 	hddDiskScan(disk, beginTime);
 	hddDiskRandomizeChunksForTests(disk);
 	gScansInProgress--;
@@ -2531,14 +2674,15 @@ void hddFreeResourcesThread() {
 	pthread_setname_np(pthread_self(), "freeResThread");
 
 	while (!gTerminate) {
-		gOpenChunks.freeUnused(eventloop_time(), gChunksMapMutex,
-		                       kMaxFreeUnused);
+		Timeout timeout(std::chrono::duration_cast<std::chrono::microseconds>(
+		    std::chrono::seconds(kDelayedStep)));
+		gOpenChunks.freeUnused(eventloop_time(), gChunksMapMutex, kMaxFreeUnused);
 		ChunkTrashManager::collectGarbage();
 		hddReleaseDisksToBeDeleted();
 		/// Release buffers older than kDelayedStep seconds
 		releaseOldIoBuffers(kOldIoBuffersExpirationTimeMs);
 
-		sleep(kDelayedStep);
+		usleep(timeout.remaining_us());
 	}
 }
 
@@ -2556,6 +2700,8 @@ void hddTerminate(void) {
 		gTesterThread.join();
 		gDisksThread.join();
 		gDelayedThread.join();
+
+		ChunkTrashManager::terminate();
 
 		try {
 			gChunkTesterThread.join();
@@ -2719,21 +2865,23 @@ int initDiskManager() {
 }
 
 int loadPlugins() {
-	std::string pluginsInstallDirPath = PLUGINS_PATH "/chunkserver";
-	std::string pluginsBuildDirPath = BUILD_PATH "/plugins/chunkserver";
+	const std::array<std::string, 5> pluginPaths = {
+	    cfg_getstring("PLUGINS_DIR", ""),              // Higher priority (user-defined)
+	    PLUGINS_PATH "/chunkserver",                   // Build-time defined path
+	    BUILD_PATH "/plugins/chunkserver",             // Build tree (for development)
+	    "/usr/local/lib/saunafs/plugins/chunkserver",  // Local install
+	    "/usr/lib/saunafs/plugins/chunkserver"         // Standard install
+	};
 
-	// Try to load plugins first from the installation directory
-	if (!pluginManager.loadPlugins(pluginsInstallDirPath)) {
-		safs_pretty_syslog(LOG_NOTICE,
-		                   "PluginManager: No plugins loaded from: %s",
-		                   pluginsInstallDirPath.c_str());
+	for (const auto &path : pluginPaths) {
+		if (path.empty()) { continue; }
 
-		// If no plugins were loaded from the installation directory,
-		// try to load them from the build directory (useful for development)
-		if (!pluginManager.loadPlugins(pluginsBuildDirPath)) {
-			safs_pretty_syslog(LOG_NOTICE,
-			                   "PluginManager: No plugins loaded from: %s",
-			                   pluginsBuildDirPath.c_str());
+		if (!pluginManager.loadPlugins(path)) {
+			safs::log_debug("PluginManager: No plugins loaded from: {}", path);
+		} else {
+			safs::log_info("PluginManager: Plugins loaded from: {}", path);
+			// stop after the first successful load, we don't want to load from multiple dirs
+			break;
 		}
 	}
 
@@ -2788,7 +2936,7 @@ int hddInit() {
 	try {
 		gDiskManager->reloadConfiguration();
 		gDiskManager->reloadDisksFromCfg();
-		ChunkTrashManager::reloadConfig();
+		ChunkTrashManager::init();
 	} catch (const Exception& ex) {
 		safs_pretty_syslog(LOG_ERR, "%s", ex.what());
 	}
@@ -2804,13 +2952,6 @@ int hddInit() {
 				                   "marked for deletion or read-only",
 				                   disk->getPaths().c_str());
 				continue;
-			}
-			ChunkTrashManager::init(disk->metaPath());
-			if (disk->isZonedDevice()) {
-				continue;
-			}
-			if (disk->metaPath() != disk->dataPath()) {
-				ChunkTrashManager::init(disk->dataPath());
 			}
 		}
 	}
