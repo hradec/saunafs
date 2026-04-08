@@ -820,11 +820,15 @@ void *write_worker(void *) {
 /* API | glock: INITIALIZED,UNLOCKED */
 void write_data_init(uint32_t cachesize, uint32_t retries, uint32_t workers,
                      uint32_t writewindowsize, uint32_t chunkserverTimeout_ms,
-                     uint32_t cachePerInodePercentage, uint32_t waveTimeout) {
+                     uint32_t cachePerInodePercentage, uint32_t waveTimeout,
+                     bool chunkserverLatencySort) {
 	uint64_t cachebytecount = uint64_t(cachesize) * 1024 * 1024;
 	uint64_t cacheblockcount = (cachebytecount / SFSBLOCKSIZE);
 	pthread_attr_t thattr;
 
+	globalChunkserverStats.setUseRoundTripTime(chunkserverLatencySort);
+	gChunkConnector.setChunkserverStats(
+	    chunkserverLatencySort ? &globalChunkserverStats : nullptr);
 	gChunkConnector.setSourceIp(fs_getsrcip());
 	gWriteWindowSize = writewindowsize;
 	gChunkserverTimeout_ms = chunkserverTimeout_ms;
@@ -1953,11 +1957,15 @@ void *write_worker(void *) {
 /* API | globalLock: INITIALIZED,UNLOCKED */
 void write_data_init(uint32_t cachesize, uint32_t retries, uint32_t workers,
                      uint32_t writewindowsize, uint32_t chunkserverTimeout_ms,
-                     uint32_t cachePerInodePercentage, uint32_t waveTimeout) {
+                     uint32_t cachePerInodePercentage, uint32_t waveTimeout,
+                     bool chunkserverLatencySort) {
 	uint64_t cachebytecount = uint64_t(cachesize) * 1024 * 1024;
 	uint64_t cacheblockcount = (cachebytecount / SFSBLOCKSIZE);
 	pthread_attr_t thattr;
 
+	globalChunkserverStats.setUseRoundTripTime(chunkserverLatencySort);
+	gChunkConnector.setChunkserverStats(
+	    chunkserverLatencySort ? &globalChunkserverStats : nullptr);
 	gChunkConnector.setSourceIp(fs_getsrcip());
 	gWriteWindowSize = writewindowsize;
 	gChunkserverTimeout_ms = chunkserverTimeout_ms;
@@ -2398,19 +2406,20 @@ int write_data_end(void *vid) {
 
 void write_data_init(uint32_t cachesize, uint32_t retries, uint32_t workers,
                      uint32_t writewindowsize, uint32_t chunkserverTimeout_ms,
-                     uint32_t cachePerInodePercentage, uint32_t waveTimeout) {
+                     uint32_t cachePerInodePercentage, uint32_t waveTimeout,
+                     bool chunkserverLatencySort) {
 	if (gUseInodeBasedWriteAlgorithm) {
 		if (InodeBasedWriteAlgorithm::gIsInitialized) { return; }
 
 		InodeBasedWriteAlgorithm::write_data_init(cachesize, retries, workers, writewindowsize,
 		                                          chunkserverTimeout_ms, cachePerInodePercentage,
-		                                          waveTimeout);
+		                                          waveTimeout, chunkserverLatencySort);
 	} else {
 		if (ChunkBasedWriteAlgorithm::gIsInitialized) { return; }
 
 		ChunkBasedWriteAlgorithm::write_data_init(cachesize, retries, workers, writewindowsize,
 		                                          chunkserverTimeout_ms, cachePerInodePercentage,
-		                                          waveTimeout);
+		                                          waveTimeout, chunkserverLatencySort);
 	}
 }
 
