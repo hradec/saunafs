@@ -1,0 +1,17 @@
+[Unit]
+Description=SaunaFS uRaft elector-only daemon
+After=network-online.target network.target
+
+[Service]
+Type=simple
+RuntimeDirectory=saunafs-uraft
+RuntimeDirectoryPreserve=restart
+RuntimeDirectoryMode=0755
+TimeoutSec=0
+ExecStart=/usr/sbin/saunafs-uraft
+Restart=on-failure
+RestartSec=60
+User=saunafs
+
+[Install]
+WantedBy=multi-user.target
