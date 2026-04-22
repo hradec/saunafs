@@ -1,0 +1,42 @@
+# Use the official Debian 12 (bookworm) base image
+FROM ubuntu:22.04 AS build
+
+# Install all system packages required to build SaunaFS.  The
+# INSTALL.md document in the SaunaFS repository lists a fairly large
+# collection of build dependencies needed when producing deb packages on
+# Ubuntu.  Most of these packages are also available on Debian 12 and
+# provide the libraries and tools (e.g. boost, fuse3, fmt, spdlog, etc.)
+# that SaunaFS links against【179789461533997†L91-L103】.  We also
+# include a few extra utilities such as git and wget for fetching
+# sources and tidy/time for documentation.
+RUN export DEBIAN_FRONTEND=noninteractive ; apt-get update && apt-get install -y --no-install-recommends \
+    acl asciidoc attr bc build-essential ca-certificates-java ccache cmake curl \
+    debhelper devscripts fuse3 git libblkid-dev libboost-filesystem-dev \
+    libboost-iostreams-dev libboost-program-options-dev libboost-system-dev \
+    libcrcutil-dev libdb-dev libfmt-dev libfuse3-dev libgoogle-perftools-dev \
+    libgtest-dev libisal-dev libjudy-dev libpam0g-dev libspdlog-dev \
+    libsystemd-dev liburcu-dev libyaml-cpp-dev lsb-release netcat-openbsd \
+    nfs4-acl-tools pkg-config pylint python3 python3-pip rsync socat sudo \
+    tidy time uuid-dev valgrind wget zlib1g-dev \
+    curl zip unzip tar \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -L https://github.com/Kitware/CMake/releases/download/v4.1.0/cmake-4.1.0-linux-x86_64.sh > cmake_install ; \
+    chmod a+x cmake_install ; yes | ./cmake_install --skip-license --prefix=/usr/
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt update
+RUN apt install -y software-properties-common
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test
+RUN apt update
+RUN apt install -y gcc-13 g++-13
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-9 10 ; \
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-9 10 ; \
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 ; \
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100
+
+RUN apt install -y asciidoctor
+
+# Set a sensible default command.  Users can override this on the
+# command line if they want to run specific SaunaFS components.
+CMD ["bash"]
